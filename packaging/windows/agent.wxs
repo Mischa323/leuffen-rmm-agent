@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Leuffen RMM agent MSI (WiX v4). Built in CI on a Windows runner around the
+  PyInstaller exe. Configured at install time via properties, e.g.:
+
+    msiexec /i leuffen-rmm-agent.msi /qn ^
+      RMM_SERVER_URL=https://rmm.example.com:8000 ^
+      RMM_API_KEY=<org enrolment key> ^
+      RMM_INSECURE_TLS=1
+
+  It installs the exe to Program Files, persists the settings as machine
+  environment variables, and registers a scheduled task that runs the agent at
+  startup as SYSTEM. Uninstall removes the task.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="Leuffen RMM Agent" Manufacturer="Leuffen IT"
+           Version="1.0.0.0" UpgradeCode="6f9a2c14-7d3e-4b8a-9d21-2b6e5a0c1f77"
+           Scope="perMachine">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of the Leuffen RMM agent is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- Publisher / about info shown in Programs &amp; Features. -->
+    <Property Id="ARPURLINFOABOUT" Value="https://leuffen.it" />
+    <Property Id="ARPHELPLINK" Value="https://leuffen.it" />
+    <!-- App icon in Programs &amp; Features. -->
+    <Icon Id="leuffen.ico" SourceFile="leuffen.ico" />
+    <Property Id="ARPPRODUCTICON" Value="leuffen.ico" />
+
+    <!-- Per-install configuration. -->
+    <Property Id="RMM_SERVER_URL" Secure="yes" />
+    <Property Id="RMM_API_KEY" Secure="yes" />
+    <Property Id="RMM_INSECURE_TLS" Value="1" Secure="yes" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="LeuffenRMM">
+        <Component Id="AgentExe" Guid="b1d4e2a0-3c55-4f6b-8a17-9e2d4c6b0a31">
+          <File Id="agentexe" Source="leuffen-rmm-agent.exe" KeyPath="yes" />
+          <Environment Id="EnvUrl" Name="RMM_SERVER_URL" Value="[RMM_SERVER_URL]"
+                       Action="set" Part="all" System="yes" Permanent="no" />
+          <Environment Id="EnvKey" Name="RMM_API_KEY" Value="[RMM_API_KEY]"
+                       Action="set" Part="all" System="yes" Permanent="no" />
+          <Environment Id="EnvInsec" Name="RMM_INSECURE_TLS" Value="[RMM_INSECURE_TLS]"
+                       Action="set" Part="all" System="yes" Permanent="no" />
+        </Component>
+        <!-- Per-user system-tray companion: autostarts at logon in the user's session. -->
+        <Component Id="TrayExe" Guid="c2e5f3b1-4d66-4a7c-9b28-1f3e5d7c2b42">
+          <File Id="trayexe" Source="leuffen-rmm-tray.exe" KeyPath="yes" />
+          <RegistryValue Root="HKLM" Key="Software\Microsoft\Windows\CurrentVersion\Run"
+                         Name="LeuffenRMMTray" Type="string"
+                         Value="&quot;[INSTALLFOLDER]leuffen-rmm-tray.exe&quot;" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="Main">
+      <ComponentRef Id="AgentExe" />
+      <ComponentRef Id="TrayExe" />
+    </Feature>
+
+    <!-- Scheduled task: run the agent at startup as SYSTEM with highest rights. -->
+    <CustomAction Id="CreateTask" Directory="INSTALLFOLDER" Impersonate="no" Execute="deferred" Return="ignore"
+      ExeCommand="schtasks /create /tn LeuffenRMMAgent /tr &quot;\&quot;[INSTALLFOLDER]leuffen-rmm-agent.exe\&quot;&quot; /sc onstart /ru SYSTEM /rl HIGHEST /f" />
+    <CustomAction Id="StartTask" Directory="INSTALLFOLDER" Impersonate="no" Execute="deferred" Return="ignore"
+      ExeCommand="schtasks /run /tn LeuffenRMMAgent" />
+    <CustomAction Id="DeleteTask" Directory="INSTALLFOLDER" Impersonate="no" Execute="deferred" Return="ignore"
+      ExeCommand="schtasks /delete /tn LeuffenRMMAgent /f" />
+
+    <!-- After an interactive install, open the configuration dialog (server URL + key).
+         Skipped for silent installs (msiexec /qn passes config via properties). -->
+    <CustomAction Id="LaunchConfig" FileRef="trayexe" ExeCommand="--settings"
+      Execute="immediate" Return="asyncNoWait" Impersonate="yes" />
+
+    <InstallExecuteSequence>
+      <Custom Action="CreateTask" After="InstallFiles" Condition="NOT Installed" />
+      <Custom Action="StartTask" After="CreateTask" Condition="NOT Installed" />
+      <Custom Action="DeleteTask" Before="RemoveFiles" Condition="REMOVE=&quot;ALL&quot;" />
+      <Custom Action="LaunchConfig" After="InstallFinalize" Condition="NOT Installed AND UILevel &gt; 3" />
+    </InstallExecuteSequence>
+  </Package>
+</Wix>

@@ -1,0 +1,9 @@
+# Core (always needed) — keep light so the idle agent is unnoticeable.
+psutil==6.1.1
+websockets==14.1
+
+# Remote desktop extras (imported lazily, only when a screen session starts).
+# Safe to omit on headless hosts that won't use screen control.
+mss==10.0.0
+Pillow==11.1.0
+pynput==1.7.7
