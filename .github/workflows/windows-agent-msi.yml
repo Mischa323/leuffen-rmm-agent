@@ -32,9 +32,11 @@ jobs:
           # truth is AGENT_VERSION in agent/inventory.py.
           $v = ((Get-Content agent/inventory.py -Raw) -match 'AGENT_VERSION\s*=\s*"([^"]+)"') `
                ? $Matches[1] : '0.0.0'
-          $mm = ($v -split '\.')[0..1] -join '.'                   # e.g. 1.1
           "ver=$v"  | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "msi=$mm.${{ github.run_number }}.0" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          # MSI ProductVersion = the agent version. MSI ignores the 4th field for
+          # upgrade detection, so each release supersedes the previous one as long
+          # as major.minor.patch increases (auto-version bumps the patch).
+          "msi=$v.0" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - uses: actions/setup-python@v5
         with:
