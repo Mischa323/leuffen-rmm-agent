@@ -1,11 +1,9 @@
-name: Auto-bump versions
+name: Auto-bump version
 
-# Keeps the agent and server versions incrementing on their own, independently.
-# On every push to main:
-#   * a change under agent/   bumps the patch of AGENT_VERSION in agent/inventory.py
-#   * a change under server/  bumps the patch of the root VERSION file
-# The two never affect each other. The bump is committed back to main with the
-# default token (which does not retrigger workflows, so there is no loop).
+# Increments the agent's patch version on every push to main that touches agent/.
+# AGENT_VERSION in agent/inventory.py is the single source of truth. The bump is
+# committed back to main with the default token (which does not retrigger
+# workflows, so there is no loop).
 
 on:
   push:
@@ -37,7 +35,6 @@ jobs:
           fi
           FILES="$(git diff --name-only "$BEFORE" "${{ github.sha }}" || true)"
           echo "agent=$(echo "$FILES" | grep -q '^agent/' && echo yes || echo no)" >> "$GITHUB_OUTPUT"
-          echo "server=$(echo "$FILES" | grep -qE '^(server/|VERSION$)' && echo yes || echo no)" >> "$GITHUB_OUTPUT"
 
       - name: Bump agent version
         if: steps.changes.outputs.agent == 'yes'
@@ -48,15 +45,6 @@ jobs:
           sed -i "s/AGENT_VERSION = \"$cur\"/AGENT_VERSION = \"$new\"/" agent/inventory.py
           echo "Agent: $cur -> $new"
 
-      - name: Bump server version
-        if: steps.changes.outputs.server == 'yes'
-        run: |
-          cur="$(tr -d '[:space:]' < VERSION)"
-          IFS=. read -r MA MI PA <<< "$cur"
-          new="$MA.$MI.$((PA + 1))"
-          printf '%s\n' "$new" > VERSION
-          echo "Server: $cur -> $new"
-
       - name: Commit bump
         run: |
           if git diff --quiet; then
@@ -65,6 +53,6 @@ jobs:
           fi
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add agent/inventory.py VERSION
+          git add agent/inventory.py
           git commit -m "chore: auto version bump [version bump]"
           git push origin HEAD:main
