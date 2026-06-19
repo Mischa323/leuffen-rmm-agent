@@ -1,0 +1,107 @@
+name: Build Windows agent MSI
+
+# Builds a standalone agent .exe (PyInstaller) and wraps it in an MSI (WiX v5).
+# Runs on a Windows runner — free for public repositories. The MSI is published
+# to a GitHub Release (v1.0.0 on manual runs, or the pushed tag).
+#
+# Optional code signing: if the repo has secrets WINDOWS_CERT_PFX_BASE64 (a
+# base64-encoded .pfx code-signing cert) and WINDOWS_CERT_PASSWORD, the exe and
+# MSI are Authenticode-signed (removes the "Unknown publisher" warning).
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build-msi:
+    runs-on: windows-latest
+    env:
+      HAS_CERT: ${{ secrets.WINDOWS_CERT_PFX_BASE64 != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version
+        id: ver
+        shell: pwsh
+        run: |
+          # The agent versions itself, independently of the server. Source of
+          # truth is AGENT_VERSION in agent/inventory.py.
+          $v = ((Get-Content agent/inventory.py -Raw) -match 'AGENT_VERSION\s*=\s*"([^"]+)"') `
+               ? $Matches[1] : '0.0.0'
+          $mm = ($v -split '\.')[0..1] -join '.'                   # e.g. 1.1
+          "ver=$v"  | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "msi=$mm.${{ github.run_number }}.0" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build deps
+        run: pip install pyinstaller websockets psutil pystray pillow mss pynput
+
+      - name: Build agent exe
+        working-directory: agent
+        run: pyinstaller --onefile --noconsole --icon ..\packaging\windows\leuffen.ico --name leuffen-rmm-agent --paths . --collect-submodules mss --collect-submodules pynput --hidden-import PIL.Image agent.py
+
+      - name: Build tray exe
+        working-directory: agent
+        run: pyinstaller --onefile --noconsole --icon ..\packaging\windows\leuffen.ico --name leuffen-rmm-tray --paths . tray.py
+
+      - name: Prepare signing certificate
+        if: env.HAS_CERT == 'true'
+        env:
+          PFX: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+        run: |
+          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\cert.pfx", [Convert]::FromBase64String($env:PFX))
+          $st = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" |
+                 Sort-Object FullName -Descending | Select-Object -First 1).FullName
+          "SIGNTOOL=$st" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Sign agent + tray exe
+        if: env.HAS_CERT == 'true'
+        env:
+          PW: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: >
+          & "$env:SIGNTOOL" sign /f "$env:RUNNER_TEMP\cert.pfx" /p "$env:PW"
+          /fd sha256 /tr http://timestamp.sectigo.com /td sha256
+          agent\dist\leuffen-rmm-agent.exe agent\dist\leuffen-rmm-tray.exe
+
+      - name: Install WiX
+        # Pin to v5 — v6/v7 require accepting the Open Source Maintenance Fee EULA.
+        run: dotnet tool install --global wix --version 5.0.2
+
+      - name: Build MSI
+        run: |
+          copy agent\dist\leuffen-rmm-agent.exe packaging\windows\leuffen-rmm-agent.exe
+          copy agent\dist\leuffen-rmm-tray.exe packaging\windows\leuffen-rmm-tray.exe
+          # Stamp the MSI version from VERSION (major.minor) + run number, so
+          # 'newest' is visible in Programs & Features and upgrades are monotonic.
+          (Get-Content packaging\windows\agent.wxs) -replace 'Version="1.0.0.0"', 'Version="${{ steps.ver.outputs.msi }}"' | Set-Content packaging\windows\agent.wxs
+          wix build packaging\windows\agent.wxs -b packaging\windows -o leuffen-rmm-agent.msi
+
+      - name: Sign MSI
+        if: env.HAS_CERT == 'true'
+        env:
+          PW: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: >
+          & "$env:SIGNTOOL" sign /f "$env:RUNNER_TEMP\cert.pfx" /p "$env:PW"
+          /fd sha256 /tr http://timestamp.sectigo.com /td sha256
+          leuffen-rmm-agent.msi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: leuffen-rmm-agent-msi
+          path: leuffen-rmm-agent.msi
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', steps.ver.outputs.ver) }}
+          # Release name carries the actual MSI version so the dashboard can show it.
+          name: Leuffen RMM Agent ${{ steps.ver.outputs.msi }}
+          files: leuffen-rmm-agent.msi
+          fail_on_unmatched_files: true
