@@ -43,6 +43,10 @@ jobs:
       - name: Install build deps
         run: pip install pyinstaller websockets psutil pystray pillow mss pynput
 
+      - name: Generate app icon
+        # The .ico is drawn programmatically (no binary committed to the repo).
+        run: python packaging/windows/make_icon.py
+
       - name: Build agent exe
         working-directory: agent
         run: pyinstaller --onefile --noconsole --icon ..\packaging\windows\leuffen.ico --name leuffen-rmm-agent --paths . --collect-submodules mss --collect-submodules pynput --hidden-import PIL.Image agent.py
