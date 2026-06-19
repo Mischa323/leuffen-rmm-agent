@@ -1,0 +1,70 @@
+name: Auto-bump versions
+
+# Keeps the agent and server versions incrementing on their own, independently.
+# On every push to main:
+#   * a change under agent/   bumps the patch of AGENT_VERSION in agent/inventory.py
+#   * a change under server/  bumps the patch of the root VERSION file
+# The two never affect each other. The bump is committed back to main with the
+# default token (which does not retrigger workflows, so there is no loop).
+
+on:
+  push:
+    branches: ["main"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: auto-version
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    # Skip the bot's own bump commits.
+    if: "!contains(github.event.head_commit.message, '[version bump]')"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine changed paths
+        id: changes
+        run: |
+          BEFORE="${{ github.event.before }}"
+          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            BEFORE="$(git rev-parse HEAD~1 2>/dev/null || echo HEAD)"
+          fi
+          FILES="$(git diff --name-only "$BEFORE" "${{ github.sha }}" || true)"
+          echo "agent=$(echo "$FILES" | grep -q '^agent/' && echo yes || echo no)" >> "$GITHUB_OUTPUT"
+          echo "server=$(echo "$FILES" | grep -qE '^(server/|VERSION$)' && echo yes || echo no)" >> "$GITHUB_OUTPUT"
+
+      - name: Bump agent version
+        if: steps.changes.outputs.agent == 'yes'
+        run: |
+          cur="$(grep -oP 'AGENT_VERSION\s*=\s*"\K[^"]+' agent/inventory.py)"
+          IFS=. read -r MA MI PA <<< "$cur"
+          new="$MA.$MI.$((PA + 1))"
+          sed -i "s/AGENT_VERSION = \"$cur\"/AGENT_VERSION = \"$new\"/" agent/inventory.py
+          echo "Agent: $cur -> $new"
+
+      - name: Bump server version
+        if: steps.changes.outputs.server == 'yes'
+        run: |
+          cur="$(tr -d '[:space:]' < VERSION)"
+          IFS=. read -r MA MI PA <<< "$cur"
+          new="$MA.$MI.$((PA + 1))"
+          printf '%s\n' "$new" > VERSION
+          echo "Server: $cur -> $new"
+
+      - name: Commit bump
+        run: |
+          if git diff --quiet; then
+            echo "No version change needed."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add agent/inventory.py VERSION
+          git commit -m "chore: auto version bump [version bump]"
+          git push origin HEAD:main
