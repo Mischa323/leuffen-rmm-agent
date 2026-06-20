@@ -74,17 +74,15 @@ def _update_windows(msi_url: str | None, insecure: bool, cfg: dict) -> dict:
     log_path = os.path.join(tmp, "update.log")
     with open(bat, "w") as f:
         # Wait for the running agent to exit (releases file locks), run the MSI
-        # upgrade, then start the agent via the scheduled task (SYSTEM, same as
-        # normal operation). Do NOT use "start <exe>" — that runs in the wrong
-        # session and leaves the scheduled task out of sync.
+        # upgrade, then ALWAYS restart the agent via the scheduled task — even if
+        # msiexec fails (e.g. a same-version reinstall or a refused downgrade), so
+        # a no-op or failed update never leaves the machine offline. Do NOT use
+        # "start <exe>" — that runs in the wrong session and desyncs the task.
         f.write(
             "@echo off\r\n"
             "timeout /t 4 /nobreak >nul\r\n"
             f'msiexec /i "{msi}" /qn /norestart{props} /l*v "{log_path}"\r\n'
-            "if %errorlevel% neq 0 (\r\n"
-            f'  echo MSI failed with code %errorlevel% >> "{log_path}"\r\n'
-            "  exit /b %errorlevel%\r\n"
-            ")\r\n"
+            f'if %errorlevel% neq 0 echo msiexec exited with code %errorlevel% >> "{log_path}"\r\n'
             "schtasks /run /tn LeuffenRMMAgent\r\n"
         )
     flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
