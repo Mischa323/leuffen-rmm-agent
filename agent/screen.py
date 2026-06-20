@@ -217,19 +217,28 @@ def _inject(ev: dict, state: dict) -> None:
                 return (geom.get("left", 0) + x / sc, geom.get("top", 0) + y / sc)
             return (x, y)
 
-        if kind in ("move", "click", "scroll"):
+        if kind in ("move", "click", "scroll", "down", "up"):
             if state.get("mouse") is None:
                 from pynput.mouse import Controller
                 state["mouse"] = Controller()
             m = state["mouse"]
             if kind == "move":
                 m.position = _pt(ev["x"], ev["y"])
-            elif kind == "click":
-                from pynput.mouse import Button
-                m.position = _pt(ev["x"], ev["y"])
-                m.click(Button.right if ev.get("button") == "right" else Button.left)
             elif kind == "scroll":
                 m.scroll(0, ev.get("dy", 0))
+            else:
+                # down / up (press-and-hold for dragging) and legacy click.
+                from pynput.mouse import Button
+                b = ev.get("button")
+                btn = (Button.right if b == "right"
+                       else Button.middle if b == "middle" else Button.left)
+                m.position = _pt(ev["x"], ev["y"])
+                if kind == "down":
+                    m.press(btn)
+                elif kind == "up":
+                    m.release(btn)
+                else:
+                    m.click(btn)
         elif kind == "key":
             if state.get("keyboard") is None:
                 from pynput.keyboard import Controller
