@@ -21,6 +21,9 @@ same trick remote-support tools use to see the sign-in screen. It streams JPEG
 frames back to the agent over a loopback TCP socket and receives input events the
 same way. On Linux (or when already interactive) the agent captures directly.
 
+Large (HiDPI) frames are downscaled before JPEG to keep the stream fast; injected
+mouse coordinates are scaled back to native pixels so clicks still land right.
+
 When launched in a user session the helper also shows an always-on-top banner so
 the person at the device clearly sees that a remote session is active and can end
 it themselves with a Disconnect button (which stops capture and tears the session
@@ -37,6 +40,11 @@ import socket
 import subprocess
 import sys
 import threading
+
+# Downscale the longest edge of a captured frame to at most this many pixels
+# before JPEG encoding. Cuts encode time + bandwidth on HiDPI/4K screens; input
+# coordinates are scaled back up so control stays pixel-accurate.
+_MAX_EDGE = 1600
 
 
 # --------------------------------------------------------------------------- #
@@ -200,16 +208,25 @@ def _inject(ev: dict, state: dict) -> None:
         if platform.system() == "Windows":
             _attach_input_desktop(state)
         kind = ev.get("kind")
+
+        def _pt(x, y):
+            # Map viewer (possibly downscaled) coordinates back to native pixels.
+            geom = state.get("geom")
+            if geom and geom.get("scale"):
+                sc = geom["scale"]
+                return (geom.get("left", 0) + x / sc, geom.get("top", 0) + y / sc)
+            return (x, y)
+
         if kind in ("move", "click", "scroll"):
             if state.get("mouse") is None:
                 from pynput.mouse import Controller
                 state["mouse"] = Controller()
             m = state["mouse"]
             if kind == "move":
-                m.position = (ev["x"], ev["y"])
+                m.position = _pt(ev["x"], ev["y"])
             elif kind == "click":
                 from pynput.mouse import Button
-                m.position = (ev["x"], ev["y"])
+                m.position = _pt(ev["x"], ev["y"])
                 m.click(Button.right if ev.get("button") == "right" else Button.left)
             elif kind == "scroll":
                 m.scroll(0, ev.get("dy", 0))
@@ -420,14 +437,17 @@ class ScreenSession:
 # --------------------------------------------------------------------------- #
 # Helper process (runs in the interactive/console session).
 # --------------------------------------------------------------------------- #
-def _capture_loop(s, fps: int, quality: int, stop: threading.Event) -> None:
+def _capture_loop(s, fps: int, quality: int, stop: threading.Event,
+                  geom: dict | None = None) -> None:
     """Grab the screen and stream JPEG frames until ``stop`` is set or the socket
     drops. On Windows it follows the active input desktop so it keeps working
-    across the secure-desktop switch."""
+    across the secure-desktop switch, downscales big frames, and survives the odd
+    BitBlt failure (e.g. mid secure-desktop switch) instead of ending."""
     is_win = platform.system() == "Windows"
     cap_state: dict = {}
     sct = None
     frames = 0
+    fails = 0
     reason = "stopped"
     try:
         import time
@@ -435,32 +455,62 @@ def _capture_loop(s, fps: int, quality: int, stop: threading.Event) -> None:
         from PIL import Image
         interval = 1.0 / fps
         while not stop.is_set():
-            if is_win:
-                # Follow the active input desktop (Default / Winlogon). On a
-                # switch, mss's cached device context is stale -- rebuild it.
-                cap_state["changed"] = False
-                _attach_input_desktop(cap_state)
-                if sct is None or cap_state.get("changed"):
-                    if sct is not None:
-                        try:
-                            sct.close()
-                        except Exception:
-                            pass
+            try:
+                if is_win:
+                    # Follow the active input desktop (Default / Winlogon). On a
+                    # switch, mss's cached device context is stale -- rebuild it.
+                    cap_state["changed"] = False
+                    _attach_input_desktop(cap_state)
+                    if sct is None or cap_state.get("changed"):
+                        if sct is not None:
+                            try:
+                                sct.close()
+                            except Exception:
+                                pass
+                        sct = mss.mss()
+                elif sct is None:
                     sct = mss.mss()
-            elif sct is None:
-                sct = mss.mss()
-            mon = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
-            shot = sct.grab(mon)
-            img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=quality)
-            data = buf.getvalue()
+                mon = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
+                shot = sct.grab(mon)
+                img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+                nw, nh = img.width, img.height
+                scale = 1.0
+                if max(nw, nh) > _MAX_EDGE:
+                    scale = _MAX_EDGE / float(max(nw, nh))
+                    img = img.resize((max(1, int(nw * scale)), max(1, int(nh * scale))),
+                                     Image.BILINEAR)
+                if geom is not None:
+                    geom["left"] = mon.get("left", 0)
+                    geom["top"] = mon.get("top", 0)
+                    geom["scale"] = scale
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=quality)
+                data = buf.getvalue()
+            except Exception as exc:
+                # Transient (desktop switch, resolution change, secure-desktop
+                # BitBlt). Log sparsely, rebuild the grabber, and keep going.
+                fails += 1
+                if fails == 1 or fails % 50 == 0:
+                    _hlog(f"frame grab error x{fails} (recovering): {exc!r}")
+                if sct is not None:
+                    try:
+                        sct.close()
+                    except Exception:
+                        pass
+                sct = None
+                if fails > 200:
+                    reason = f"giving up after {fails} grab errors: {exc!r}"
+                    break
+                time.sleep(0.2)
+                continue
+            fails = 0
             if not _send_msg(s, data):
                 reason = "viewer/socket closed"
                 break
             frames += 1
             if frames == 1:
-                _hlog(f"first frame sent ({img.width}x{img.height}, {len(data)} bytes)")
+                _hlog(f"first frame sent ({img.width}x{img.height} @scale {scale:.2f}, "
+                      f"{len(data)} bytes)")
             elif frames % 200 == 0:
                 _hlog(f"{frames} frames sent (last {img.width}x{img.height}, {len(data)} bytes)")
             time.sleep(interval)
@@ -588,7 +638,10 @@ def run_screen_helper(argv) -> None:
         return
 
     stop = threading.Event()
-    inj_state = {"mouse": None, "keyboard": None}
+    # Shared geometry (downscale factor + monitor origin) so the input thread can
+    # map viewer coordinates back to native pixels.
+    geom = {"scale": 1.0, "left": 0, "top": 0}
+    inj_state = {"mouse": None, "keyboard": None, "geom": geom}
 
     def _input_reader():
         while not stop.is_set():
@@ -609,14 +662,14 @@ def run_screen_helper(argv) -> None:
     show_banner = mode == "user" and platform.system() == "Windows"
     _hlog(f"consent banner {'enabled' if show_banner else 'disabled'} for this session")
     if show_banner:
-        cap = threading.Thread(target=_capture_loop, args=(s, fps, quality, stop),
+        cap = threading.Thread(target=_capture_loop, args=(s, fps, quality, stop, geom),
                                daemon=True)
         cap.start()
         _show_consent_banner(stop)
         stop.set()
         cap.join(timeout=5)
     else:
-        _capture_loop(s, fps, quality, stop)
+        _capture_loop(s, fps, quality, stop, geom)
     _hlog("helper exiting")
 
     try:
