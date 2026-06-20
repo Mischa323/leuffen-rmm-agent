@@ -8,9 +8,11 @@ interactive user's desktop (``BitBlt`` fails). So on Windows the capture + input
 injection run in a short-lived **helper** process launched inside the active
 session. Two launch paths are tried, in order:
 
-  1. the signed-in user's session (input then acts as that user); and
-  2. failing that, the console session as SYSTEM -- this covers the case where
-     **nobody is logged in** (the login screen) or the workstation is **locked**.
+  1. the signed-in user's session (``mode=user``; input acts as that user, and a
+     consent banner is shown); and
+  2. failing that, the console session as SYSTEM (``mode=system``) -- this covers
+     the case where **nobody is logged in** (the login screen) or the
+     workstation is **locked**, where there is no user to show a banner to.
 
 The helper attaches its thread to the active *input* desktop
 (``OpenInputDesktop``/``SetThreadDesktop``) on every frame, so it follows the
@@ -18,6 +20,11 @@ switch to/from the secure ``Winlogon`` desktop (login, lock screen, UAC) -- the
 same trick remote-support tools use to see the sign-in screen. It streams JPEG
 frames back to the agent over a loopback TCP socket and receives input events the
 same way. On Linux (or when already interactive) the agent captures directly.
+
+When launched in a user session the helper also shows an always-on-top banner so
+the person at the device clearly sees that a remote session is active and can end
+it themselves with a Disconnect button (which stops capture and tears the session
+down).
 """
 from __future__ import annotations
 
@@ -30,6 +37,41 @@ import socket
 import subprocess
 import sys
 import threading
+
+
+# --------------------------------------------------------------------------- #
+# Logbook — both the agent (SYSTEM, session 0) and the capture helper write here
+# so we can see exactly what happens during a remote session, especially why the
+# login/lock (secure Winlogon) screen does or doesn't come through. Lives next to
+# the agent log: %ProgramData%\LeuffenRMM\screen.log on Windows.
+# --------------------------------------------------------------------------- #
+def _log_dir() -> str:
+    env = os.environ.get("RMM_DATA_DIR")
+    if env:
+        return env
+    if os.name == "nt":
+        return os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "LeuffenRMM")
+    return os.path.join(os.path.expanduser("~"), ".leuffen-rmm")
+
+
+def _hlog(msg: str) -> None:
+    """Append one timestamped line to screen.log (best-effort, never raises)."""
+    try:
+        import datetime
+        d = _log_dir()
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, "screen.log")
+        # Keep it from growing without bound: roll over past ~2 MB.
+        try:
+            if os.path.getsize(path) > 2_000_000:
+                os.replace(path, path + ".1")
+        except OSError:
+            pass
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"{ts} [pid {os.getpid()}] {msg}\n")
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------------- #
@@ -114,13 +156,22 @@ def _attach_input_desktop(state: dict) -> None:
     when the desktop actually switches. Sets ``state['changed']`` on a switch so
     callers (e.g. the capture loop) know to rebuild desktop-bound resources."""
     try:
+        import ctypes
         user32 = _win_desk_api()
     except Exception:
         return
     # 0 flags; GENERIC_ALL access so we can both read pixels and inject input.
     hdesk = user32.OpenInputDesktop(0, False, 0x10000000)
     if not hdesk:
+        # Throttle: only log the first failure (e.g. a non-SYSTEM helper denied
+        # access to the secure Winlogon desktop) until it next succeeds.
+        if not state.get("_openfail"):
+            state["_openfail"] = True
+            _hlog(f"OpenInputDesktop failed (err={ctypes.GetLastError()}) -- cannot "
+                  f"attach to the input desktop (err 5 = access denied means this "
+                  f"helper is not SYSTEM, so the lock/login screen can't be captured)")
         return
+    state["_openfail"] = False
     name = _win_desktop_name(user32, hdesk)
     if name and name == state.get("desk_name"):
         user32.CloseDesktop(hdesk)
@@ -135,7 +186,9 @@ def _attach_input_desktop(state: dict) -> None:
         state["desk_handle"] = hdesk
         state["desk_name"] = name
         state["changed"] = True
+        _hlog(f"attached to input desktop '{name or '?'}'")
     else:
+        _hlog(f"SetThreadDesktop('{name or '?'}') failed (err={ctypes.GetLastError()})")
         user32.CloseDesktop(hdesk)
 
 
@@ -181,7 +234,7 @@ class ScreenSession:
     def __init__(self, send_bytes, fps: int = 4, quality: int = 50, on_error=None):
         self.send_bytes = send_bytes
         self.on_error = on_error
-        self.fps = max(1, min(fps, 15))
+        self.fps = max(1, min(fps, 24))
         self.quality = max(10, min(quality, 90))
         self._task: asyncio.Task | None = None
         self._thread: threading.Thread | None = None
@@ -218,12 +271,16 @@ class ScreenSession:
             srv.settimeout(20)
             port = srv.getsockname()[1]
             token = secrets.token_hex(16)
+            _hlog(f"screen session starting (bridge on 127.0.0.1:{port}, "
+                  f"fps={self.fps}, quality={self.quality})")
             if not self._launch_helper(port, token):
+                _hlog("no capture helper could be launched")
                 self._fail("could not start capture helper in the active session")
                 return
             try:
                 conn, _ = srv.accept()
             except socket.timeout:
+                _hlog("capture helper did not connect within 20s")
                 self._fail("capture helper did not connect")
                 return
             finally:
@@ -253,7 +310,9 @@ class ScreenSession:
                 except Exception:
                     break
             if not self._stop:
-                self._fail("capture stream ended")
+                # The helper went away on its own -- most often because the user
+                # at the device clicked Disconnect on the consent banner.
+                self._fail("remote session ended at the device")
         except Exception as exc:
             self._fail(f"capture bridge error: {exc}")
         finally:
@@ -269,23 +328,32 @@ class ScreenSession:
                                   _run_in_console_session_as_system)
         except Exception:
             return False
-        args = f"--screen-helper {port} {token} {self.fps} {self.quality}"
+        base = f"--screen-helper {port} {token} {self.fps} {self.quality}"
         if getattr(sys, "frozen", False):
-            cmdline = f'"{sys.executable}" {args}'
+            prefix = f'"{sys.executable}"'
         else:
             script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent.py")
-            cmdline = f'"{sys.executable}" "{script}" {args}'
-        # Prefer the signed-in user's session (input acts as the user). If nobody
-        # is signed in or the box is locked, fall back to a SYSTEM helper in the
-        # console session, which can attach to the secure Winlogon desktop.
+            prefix = f'"{sys.executable}" "{script}"'
+        # Launch as SYSTEM in the console session FIRST. Only a SYSTEM process can
+        # attach to the secure Winlogon desktop (lock screen / sign-in), so this is
+        # the path that makes the login screen work -- and it also captures the
+        # normal desktop fine. The banner still shows (on the user's desktop). Fall
+        # back to the user's own session only if the SYSTEM launch fails.
         try:
-            if _run_in_active_session(cmdline):
+            if _run_in_console_session_as_system(f"{prefix} {base} user"):
+                _hlog("helper launched as SYSTEM in the console session")
                 return True
-        except Exception:
-            pass
+            _hlog("console-session SYSTEM launch returned false; trying user session")
+        except Exception as exc:
+            _hlog(f"console-session SYSTEM launch raised {exc!r}; trying user session")
         try:
-            return bool(_run_in_console_session_as_system(cmdline))
-        except Exception:
+            if _run_in_active_session(f"{prefix} {base} user"):
+                _hlog("helper launched in the user session (fallback)")
+                return True
+            _hlog("user-session launch returned false")
+            return False
+        except Exception as exc:
+            _hlog(f"user-session launch raised {exc!r}")
             return False
 
     def _fail(self, msg: str) -> None:
@@ -349,54 +417,18 @@ class ScreenSession:
             pass
 
 
-def run_screen_helper(argv) -> None:
-    """Session helper: capture frames + inject input over a loopback socket.
-
-    Launched by the SYSTEM agent inside the interactive session (or, when nobody
-    is signed in, inside the console session as SYSTEM) as
-    ``agent.exe --screen-helper <port> <token> <fps> <quality>``.
-    """
-    try:
-        i = argv.index("--screen-helper")
-        port = int(argv[i + 1])
-        token = argv[i + 2]
-        fps = max(1, min(int(argv[i + 3]), 15))
-        quality = max(10, min(int(argv[i + 4]), 90))
-    except Exception:
-        return
-    try:
-        s = socket.create_connection(("127.0.0.1", port), timeout=15)
-    except Exception:
-        return
-    if not _send_msg(s, token.encode("utf-8")):
-        try:
-            s.close()
-        except Exception:
-            pass
-        return
-
-    stop = threading.Event()
-    # Each thread keeps its own desktop-attach state (a desktop binding is
-    # per-thread on Windows), so capture and input track the input desktop
-    # independently.
-    cap_state = {"mouse": None, "keyboard": None}
-    inj_state = {"mouse": None, "keyboard": None}
-
-    def _input_reader():
-        while not stop.is_set():
-            data = _recv_msg(s)
-            if data is None:
-                break
-            try:
-                _inject(json.loads(data.decode("utf-8", "replace")), inj_state)
-            except Exception:
-                pass
-        stop.set()
-
-    threading.Thread(target=_input_reader, daemon=True).start()
-
+# --------------------------------------------------------------------------- #
+# Helper process (runs in the interactive/console session).
+# --------------------------------------------------------------------------- #
+def _capture_loop(s, fps: int, quality: int, stop: threading.Event) -> None:
+    """Grab the screen and stream JPEG frames until ``stop`` is set or the socket
+    drops. On Windows it follows the active input desktop so it keeps working
+    across the secure-desktop switch."""
     is_win = platform.system() == "Windows"
+    cap_state: dict = {}
     sct = None
+    frames = 0
+    reason = "stopped"
     try:
         import time
         import mss
@@ -422,12 +454,21 @@ def run_screen_helper(argv) -> None:
             img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
             buf = io.BytesIO()
             img.save(buf, format="JPEG", quality=quality)
-            if not _send_msg(s, buf.getvalue()):
+            data = buf.getvalue()
+            if not _send_msg(s, data):
+                reason = "viewer/socket closed"
                 break
+            frames += 1
+            if frames == 1:
+                _hlog(f"first frame sent ({img.width}x{img.height}, {len(data)} bytes)")
+            elif frames % 200 == 0:
+                _hlog(f"{frames} frames sent (last {img.width}x{img.height}, {len(data)} bytes)")
             time.sleep(interval)
-    except Exception:
-        pass
+    except Exception as exc:
+        reason = f"error: {exc!r}"
     finally:
+        _hlog(f"capture loop ended after {frames} frames ({reason})")
+        # Whatever ended the loop, make sure the banner/other threads wind down.
         stop.set()
         if sct is not None:
             try:
@@ -438,6 +479,150 @@ def run_screen_helper(argv) -> None:
             s.close()
         except Exception:
             pass
+
+
+def _show_consent_banner(stop: threading.Event) -> None:
+    """Show an always-on-top banner telling the person at the device that a remote
+    session is active, with a Disconnect button that ends it. Blocks (runs the Tk
+    loop) until the user disconnects or capture stops, then sets ``stop``.
+
+    Degrades to a plain wait if no GUI/Tk is available, so capture is unaffected.
+    """
+    try:
+        import tkinter as tk
+    except Exception:
+        stop.wait()
+        return
+    try:
+        root = tk.Tk()
+    except Exception:
+        stop.wait()
+        return
+    try:
+        root.title("Leuffen RMM — remote session")
+        root.overrideredirect(True)        # borderless banner
+        root.attributes("-topmost", True)  # stay above other windows
+        try:
+            root.attributes("-toolwindow", True)  # keep it off the taskbar (Windows)
+        except Exception:
+            pass
+
+        bg = "#b00020"  # alert red
+        frame = tk.Frame(root, bg=bg, padx=14, pady=10)
+        frame.pack(fill="both", expand=True)
+        tk.Label(
+            frame,
+            text="●  Remote support is connected — someone can see and control this screen.",
+            bg=bg, fg="white",
+            font=("Segoe UI", 10, "bold"),
+        ).pack(side="left", padx=(0, 14))
+
+        def _disconnect(*_):
+            stop.set()
+            try:
+                root.destroy()
+            except Exception:
+                pass
+
+        tk.Button(
+            frame, text="Disconnect", command=_disconnect,
+            bg="white", fg=bg, font=("Segoe UI", 10, "bold"),
+            relief="flat", padx=12, pady=2, cursor="hand2",
+        ).pack(side="right")
+
+        # Top-centre of the primary monitor.
+        root.update_idletasks()
+        w = max(root.winfo_reqwidth(), 460)
+        h = max(root.winfo_reqheight(), 48)
+        sw = root.winfo_screenwidth()
+        root.geometry(f"{w}x{h}+{(sw - w) // 2}+24")
+
+        # Close the banner if capture stops for any other reason (operator ended
+        # the session, socket dropped, etc.).
+        def _poll():
+            if stop.is_set():
+                try:
+                    root.destroy()
+                except Exception:
+                    pass
+                return
+            root.after(400, _poll)
+
+        root.after(400, _poll)
+        root.mainloop()
+    except Exception:
+        pass
+    finally:
+        stop.set()
+
+
+def run_screen_helper(argv) -> None:
+    """Session helper: capture frames + inject input over a loopback socket.
+
+    Launched by the SYSTEM agent as
+    ``agent.exe --screen-helper <port> <token> <fps> <quality> [mode]`` where
+    ``mode`` is ``user`` (interactive session; shows the consent banner) or
+    ``system`` (console session, e.g. the login/lock screen; no banner).
+    """
+    try:
+        i = argv.index("--screen-helper")
+        port = int(argv[i + 1])
+        token = argv[i + 2]
+        fps = max(1, min(int(argv[i + 3]), 24))
+        quality = max(10, min(int(argv[i + 4]), 90))
+        mode = argv[i + 5] if len(argv) > i + 5 else "user"
+    except Exception:
+        return
+    _hlog(f"helper started (mode={mode}, fps={fps}, quality={quality})")
+    try:
+        s = socket.create_connection(("127.0.0.1", port), timeout=15)
+    except Exception as exc:
+        _hlog(f"helper could not connect to the bridge: {exc!r}")
+        return
+    if not _send_msg(s, token.encode("utf-8")):
+        _hlog("helper failed to send auth token")
+        try:
+            s.close()
+        except Exception:
+            pass
+        return
+
+    stop = threading.Event()
+    inj_state = {"mouse": None, "keyboard": None}
+
+    def _input_reader():
+        while not stop.is_set():
+            data = _recv_msg(s)
+            if data is None:
+                break
+            try:
+                _inject(json.loads(data.decode("utf-8", "replace")), inj_state)
+            except Exception:
+                pass
+        stop.set()
+
+    threading.Thread(target=_input_reader, daemon=True).start()
+
+    # In a real user session, run capture in a background thread and give the
+    # main thread to the consent banner (Tk must own the main thread). Otherwise
+    # (login/lock screen) just capture on the main thread -- no user to notify.
+    show_banner = mode == "user" and platform.system() == "Windows"
+    _hlog(f"consent banner {'enabled' if show_banner else 'disabled'} for this session")
+    if show_banner:
+        cap = threading.Thread(target=_capture_loop, args=(s, fps, quality, stop),
+                               daemon=True)
+        cap.start()
+        _show_consent_banner(stop)
+        stop.set()
+        cap.join(timeout=5)
+    else:
+        _capture_loop(s, fps, quality, stop)
+    _hlog("helper exiting")
+
+    try:
+        s.close()
+    except Exception:
+        pass
 
 
 def _send_sas() -> None:
