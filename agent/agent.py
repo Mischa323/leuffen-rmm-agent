@@ -396,7 +396,9 @@ class Agent:
             await self._send({"type": "screen_error", "error": err})
 
         self.screen = ScreenSession(send_bytes, fps=msg.get("fps", 4),
-                                    quality=msg.get("quality", 50), on_error=on_error)
+                                    quality=msg.get("quality", 50),
+                                    max_edge=msg.get("max_edge", 1600),
+                                    on_error=on_error)
         err = await self.screen.start()
         if err:
             # Surface on the screen channel so the remote viewer shows the reason
