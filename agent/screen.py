@@ -21,13 +21,14 @@ same trick remote-support tools use to see the sign-in screen. It streams JPEG
 frames back to the agent over a loopback TCP socket and receives input events the
 same way. On Linux (or when already interactive) the agent captures directly.
 
-Large (HiDPI) frames are downscaled before JPEG to keep the stream fast; injected
-mouse coordinates are scaled back to native pixels so clicks still land right.
+Frames whose longest edge exceeds ``max_edge`` (sent by the viewer's speed
+preset) are downscaled before JPEG to keep the stream fast; injected mouse
+coordinates are scaled back to native pixels so clicks still land right.
 
 Clipboard text syncs both ways: ``clip_paste`` sets the remote clipboard and
 sends Ctrl+V; ``clip_get`` reads the remote clipboard and ships it back to the
 viewer as a small ``LRMMCLIP``-tagged binary blob (the server already relays
-agent binary to the viewer unchanged, so this needs no server change).
+agent binary to the viewer, so this needs no server change).
 
 When launched in a user session the helper also shows an always-on-top banner so
 the person at the device clearly sees that a remote session is active and can end
@@ -46,9 +47,9 @@ import subprocess
 import sys
 import threading
 
-# Downscale the longest edge of a captured frame to at most this many pixels
-# before JPEG encoding. Cuts encode time + bandwidth on HiDPI/4K screens; input
-# coordinates are scaled back up so control stays pixel-accurate.
+# Default cap on the longest edge of a captured frame before JPEG encoding; the
+# viewer overrides it per speed preset (smaller = higher fps, larger = crisper).
+# Input coordinates are scaled back up so control stays pixel-accurate.
 _MAX_EDGE = 1600
 
 # Magic header marking a clipboard payload on the (otherwise JPEG) frame stream.
@@ -362,11 +363,16 @@ def _inject(ev: dict, state: dict) -> None:
 
 
 class ScreenSession:
-    def __init__(self, send_bytes, fps: int = 4, quality: int = 50, on_error=None):
+    def __init__(self, send_bytes, fps: int = 4, quality: int = 50,
+                 max_edge: int = 1600, on_error=None):
         self.send_bytes = send_bytes
         self.on_error = on_error
         self.fps = max(1, min(fps, 24))
         self.quality = max(10, min(quality, 90))
+        try:
+            self.max_edge = max(320, min(int(max_edge or _MAX_EDGE), 4096))
+        except Exception:
+            self.max_edge = _MAX_EDGE
         self._task: asyncio.Task | None = None
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -403,7 +409,7 @@ class ScreenSession:
             port = srv.getsockname()[1]
             token = secrets.token_hex(16)
             _hlog(f"screen session starting (bridge on 127.0.0.1:{port}, "
-                  f"fps={self.fps}, quality={self.quality})")
+                  f"fps={self.fps}, quality={self.quality}, max_edge={self.max_edge})")
             if not self._launch_helper(port, token):
                 _hlog("no capture helper could be launched")
                 self._fail("could not start capture helper in the active session")
@@ -443,8 +449,9 @@ class ScreenSession:
                     break
             if not self._stop:
                 # The helper went away on its own -- most often because the user
-                # at the device clicked Disconnect on the consent banner.
-                self._fail("remote session ended at the device")
+                # at the device clicked Disconnect on the consent banner. Tell the
+                # operator clearly (not as a "capture failed" error).
+                self._notify("The remote session was ended at the device.")
         except Exception as exc:
             self._fail(f"capture bridge error: {exc}")
         finally:
@@ -466,20 +473,22 @@ class ScreenSession:
         else:
             script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent.py")
             prefix = f'"{sys.executable}" "{script}"'
+        # Args after base: <mode> <max_edge>.
+        tail = f"user {self.max_edge}"
         # Launch as SYSTEM in the console session FIRST. Only a SYSTEM process can
         # attach to the secure Winlogon desktop (lock screen / sign-in), so this is
         # the path that makes the login screen work -- and it also captures the
         # normal desktop fine. The banner still shows (on the user's desktop). Fall
         # back to the user's own session only if the SYSTEM launch fails.
         try:
-            if _run_in_console_session_as_system(f"{prefix} {base} user"):
+            if _run_in_console_session_as_system(f"{prefix} {base} {tail}"):
                 _hlog("helper launched as SYSTEM in the console session")
                 return True
             _hlog("console-session SYSTEM launch returned false; trying user session")
         except Exception as exc:
             _hlog(f"console-session SYSTEM launch raised {exc!r}; trying user session")
         try:
-            if _run_in_active_session(f"{prefix} {base} user"):
+            if _run_in_active_session(f"{prefix} {base} {tail}"):
                 _hlog("helper launched in the user session (fallback)")
                 return True
             _hlog("user-session launch returned false")
@@ -493,6 +502,14 @@ class ScreenSession:
             try:
                 asyncio.run_coroutine_threadsafe(
                     self.on_error(f"capture failed: {msg}"), self._loop)
+            except Exception:
+                pass
+
+    def _notify(self, msg: str) -> None:
+        """Send an informational message to the viewer (no 'capture failed' prefix)."""
+        if self.on_error and self._loop and not self._stop:
+            try:
+                asyncio.run_coroutine_threadsafe(self.on_error(msg), self._loop)
             except Exception:
                 pass
 
@@ -555,7 +572,8 @@ class ScreenSession:
 # Helper process (runs in the interactive/console session).
 # --------------------------------------------------------------------------- #
 def _capture_loop(s, fps: int, quality: int, stop: threading.Event,
-                  geom: dict | None = None, send_lock: threading.Lock | None = None) -> None:
+                  geom: dict | None = None, send_lock: threading.Lock | None = None,
+                  max_edge: int = _MAX_EDGE) -> None:
     """Grab the screen and stream JPEG frames until ``stop`` is set or the socket
     drops. On Windows it follows the active input desktop so it keeps working
     across the secure-desktop switch, downscales big frames, and survives the odd
@@ -600,8 +618,8 @@ def _capture_loop(s, fps: int, quality: int, stop: threading.Event,
                 img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
                 nw, nh = img.width, img.height
                 scale = 1.0
-                if max(nw, nh) > _MAX_EDGE:
-                    scale = _MAX_EDGE / float(max(nw, nh))
+                if max(nw, nh) > max_edge:
+                    scale = max_edge / float(max(nw, nh))
                     img = img.resize((max(1, int(nw * scale)), max(1, int(nh * scale))),
                                      Image.BILINEAR)
                 if geom is not None:
@@ -738,8 +756,8 @@ def run_screen_helper(argv) -> None:
     """Session helper: capture frames + inject input over a loopback socket.
 
     Launched by the SYSTEM agent as
-    ``agent.exe --screen-helper <port> <token> <fps> <quality> [mode]`` where
-    ``mode`` is ``user`` (interactive session; shows the consent banner) or
+    ``agent.exe --screen-helper <port> <token> <fps> <quality> [mode] [max_edge]``
+    where ``mode`` is ``user`` (interactive session; shows the consent banner) or
     ``system`` (console session, e.g. the login/lock screen; no banner).
     """
     try:
@@ -749,9 +767,13 @@ def run_screen_helper(argv) -> None:
         fps = max(1, min(int(argv[i + 3]), 24))
         quality = max(10, min(int(argv[i + 4]), 90))
         mode = argv[i + 5] if len(argv) > i + 5 else "user"
+        try:
+            max_edge = max(320, min(int(argv[i + 6]), 4096)) if len(argv) > i + 6 else _MAX_EDGE
+        except Exception:
+            max_edge = _MAX_EDGE
     except Exception:
         return
-    _hlog(f"helper started (mode={mode}, fps={fps}, quality={quality})")
+    _hlog(f"helper started (mode={mode}, fps={fps}, quality={quality}, max_edge={max_edge})")
     try:
         s = socket.create_connection(("127.0.0.1", port), timeout=15)
     except Exception as exc:
@@ -794,13 +816,14 @@ def run_screen_helper(argv) -> None:
     _hlog(f"consent banner {'enabled' if show_banner else 'disabled'} for this session")
     if show_banner:
         cap = threading.Thread(target=_capture_loop,
-                               args=(s, fps, quality, stop, geom, send_lock), daemon=True)
+                               args=(s, fps, quality, stop, geom, send_lock, max_edge),
+                               daemon=True)
         cap.start()
         _show_consent_banner(stop)
         stop.set()
         cap.join(timeout=5)
     else:
-        _capture_loop(s, fps, quality, stop, geom, send_lock)
+        _capture_loop(s, fps, quality, stop, geom, send_lock, max_edge)
     _hlog("helper exiting")
 
     try:
