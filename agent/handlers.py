@@ -143,6 +143,78 @@ def _run_in_active_session(cmdline: str) -> bool:
         k32.CloseHandle(hTok)
 
 
+def _run_in_console_session_as_system(cmdline: str) -> bool:
+    """Launch a command as SYSTEM inside the physical console session.
+
+    Used when no user is signed in (lock screen / login screen), where
+    ``WTSQueryUserToken`` has no user token to hand back. We duplicate the
+    agent's own SYSTEM token, retarget it to the console session, and start the
+    process there. The launched helper then attaches its thread to the active
+    *input* desktop (``OpenInputDesktop``/``SetThreadDesktop``) so it can see and
+    drive the secure ``Winlogon`` desktop (login / lock / UAC prompts)."""
+    import ctypes
+    from ctypes import wintypes
+
+    sid = _active_session_id()
+    if sid is None:
+        return False
+    k32, adv, env_api = (ctypes.windll.kernel32, ctypes.windll.advapi32,
+                         ctypes.windll.userenv)
+    hTok = wintypes.HANDLE()
+    # TOKEN_ALL_ACCESS on the agent's own (SYSTEM) process token.
+    if not adv.OpenProcessToken(k32.GetCurrentProcess(), 0xF01FF, ctypes.byref(hTok)):
+        return False
+    try:
+        hDup = wintypes.HANDLE()
+        # TokenPrimary=1, SecurityImpersonation=2, TOKEN_ALL_ACCESS
+        if not adv.DuplicateTokenEx(hTok, 0xF01FF, None, 2, 1, ctypes.byref(hDup)):
+            return False
+        try:
+            # Retarget the duplicated token at the console session (TokenSessionId=12).
+            target = wintypes.DWORD(sid)
+            adv.SetTokenInformation(hDup, 12, ctypes.byref(target),
+                                    ctypes.sizeof(target))
+            env = ctypes.c_void_p()
+            if not env_api.CreateEnvironmentBlock(ctypes.byref(env), hDup, False):
+                env = None
+
+            class STARTUPINFO(ctypes.Structure):
+                _fields_ = [("cb", wintypes.DWORD), ("lpReserved", wintypes.LPWSTR),
+                            ("lpDesktop", wintypes.LPWSTR), ("lpTitle", wintypes.LPWSTR),
+                            ("dwX", wintypes.DWORD), ("dwY", wintypes.DWORD),
+                            ("dwXSize", wintypes.DWORD), ("dwYSize", wintypes.DWORD),
+                            ("dwXCountChars", wintypes.DWORD), ("dwYCountChars", wintypes.DWORD),
+                            ("dwFillAttribute", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+                            ("wShowWindow", wintypes.WORD), ("cbReserved2", wintypes.WORD),
+                            ("lpReserved2", ctypes.c_void_p), ("hStdInput", wintypes.HANDLE),
+                            ("hStdOutput", wintypes.HANDLE), ("hStdError", wintypes.HANDLE)]
+
+            class PROCESS_INFORMATION(ctypes.Structure):
+                _fields_ = [("hProcess", wintypes.HANDLE), ("hThread", wintypes.HANDLE),
+                            ("dwProcessId", wintypes.DWORD), ("dwThreadId", wintypes.DWORD)]
+
+            si = STARTUPINFO()
+            si.cb = ctypes.sizeof(si)
+            # Start on the default desktop; the helper hops to the input desktop itself.
+            si.lpDesktop = "winsta0\\default"
+            pi = PROCESS_INFORMATION()
+            # CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW
+            flags = 0x00000400 | 0x08000000
+            ok = adv.CreateProcessAsUserW(hDup, None, ctypes.c_wchar_p(cmdline), None, None,
+                                          False, flags, env, None, ctypes.byref(si),
+                                          ctypes.byref(pi))
+            if ok:
+                k32.CloseHandle(pi.hProcess)
+                k32.CloseHandle(pi.hThread)
+            if env:
+                env_api.DestroyEnvironmentBlock(env)
+            return bool(ok)
+        finally:
+            k32.CloseHandle(hDup)
+    finally:
+        k32.CloseHandle(hTok)
+
+
 def power_action(action: str) -> dict:
     """Perform a power/session action for the host OS."""
     try:
