@@ -572,4 +572,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # When launched in the interactive session as a screen-capture helper, run
+    # that loop instead of the full agent (skips the single-instance lock).
+    if "--screen-helper" in sys.argv:
+        from screen import run_screen_helper
+        run_screen_helper(sys.argv)
+    else:
+        main()
