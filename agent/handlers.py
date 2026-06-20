@@ -191,11 +191,17 @@ def _run_in_console_session_as_system(cmdline: str) -> bool:
         return False
     k32, adv, env_api = (ctypes.windll.kernel32, ctypes.windll.advapi32,
                          ctypes.windll.userenv)
+    # Declare signatures so the 64-bit pseudo-handle from GetCurrentProcess and the
+    # token handle aren't truncated to 32-bit -- that truncation was the err=6
+    # (ERROR_INVALID_HANDLE) that sent every session to the user-session fallback,
+    # which can't see the secure Winlogon desktop (lock/login screen).
+    k32.GetCurrentProcess.restype = wintypes.HANDLE
+    adv.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                     ctypes.POINTER(wintypes.HANDLE)]
     hTok = wintypes.HANDLE()
     # TOKEN_ALL_ACCESS on the agent's own (SYSTEM) process token.
     if not adv.OpenProcessToken(k32.GetCurrentProcess(), 0xF01FF, ctypes.byref(hTok)):
-        _hlog(f"console-session: OpenProcessToken failed (err={k32.GetLastError()}; "
-              f"agent is probably not running as SYSTEM)")
+        _hlog(f"console-session: OpenProcessToken failed (err={k32.GetLastError()})")
         return False
     try:
         hDup = wintypes.HANDLE()
