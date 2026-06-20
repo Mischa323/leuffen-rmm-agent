@@ -393,18 +393,20 @@ class ScreenSession:
     # ---- Direct capture (Linux / already-interactive) ----
     async def _loop_direct(self) -> None:
         import mss
+        import time
         from PIL import Image
         interval = 1.0 / self.fps
         try:
             with mss.mss() as sct:
                 monitor = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
                 while True:
+                    t0 = time.monotonic()
                     shot = sct.grab(monitor)
                     img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
                     buf = io.BytesIO()
                     img.save(buf, format="JPEG", quality=self.quality)
                     await self.send_bytes(buf.getvalue())
-                    await asyncio.sleep(interval)
+                    await asyncio.sleep(max(0.0, interval - (time.monotonic() - t0)))
         except asyncio.CancelledError:
             pass
         except Exception as exc:
@@ -464,6 +466,7 @@ def _capture_loop(s, fps: int, quality: int, stop: threading.Event,
         from PIL import Image
         interval = 1.0 / fps
         while not stop.is_set():
+            t0 = time.monotonic()
             try:
                 if is_win:
                     # Follow the active input desktop (Default / Winlogon). On a
@@ -522,7 +525,10 @@ def _capture_loop(s, fps: int, quality: int, stop: threading.Event,
                       f"{len(data)} bytes)")
             elif frames % 200 == 0:
                 _hlog(f"{frames} frames sent (last {img.width}x{img.height}, {len(data)} bytes)")
-            time.sleep(interval)
+            # Pace to the target fps but subtract the time already spent grabbing
+            # and encoding, so a slow frame doesn't stack on top of a full
+            # interval (which capped the real rate well below the requested fps).
+            time.sleep(max(0.0, interval - (time.monotonic() - t0)))
     except Exception as exc:
         reason = f"error: {exc!r}"
     finally:
