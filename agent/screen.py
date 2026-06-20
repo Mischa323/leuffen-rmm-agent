@@ -24,6 +24,11 @@ same way. On Linux (or when already interactive) the agent captures directly.
 Large (HiDPI) frames are downscaled before JPEG to keep the stream fast; injected
 mouse coordinates are scaled back to native pixels so clicks still land right.
 
+Clipboard text syncs both ways: ``clip_paste`` sets the remote clipboard and
+sends Ctrl+V; ``clip_get`` reads the remote clipboard and ships it back to the
+viewer as a small ``LRMMCLIP``-tagged binary blob (the server already relays
+agent binary to the viewer unchanged, so this needs no server change).
+
 When launched in a user session the helper also shows an always-on-top banner so
 the person at the device clearly sees that a remote session is active and can end
 it themselves with a Disconnect button (which stops capture and tears the session
@@ -45,6 +50,10 @@ import threading
 # before JPEG encoding. Cuts encode time + bandwidth on HiDPI/4K screens; input
 # coordinates are scaled back up so control stays pixel-accurate.
 _MAX_EDGE = 1600
+
+# Magic header marking a clipboard payload on the (otherwise JPEG) frame stream.
+# JPEG always starts with FF D8 FF, so there's no collision with a real frame.
+_CLIP_MAGIC = b"LRMMCLIP"
 
 
 # --------------------------------------------------------------------------- #
@@ -114,6 +123,83 @@ def _recv_msg(sock) -> bytes | None:
     if n <= 0 or n > 64 * 1024 * 1024:
         return None
     return _recv_exact(sock, n)
+
+
+# --------------------------------------------------------------------------- #
+# Clipboard (Windows): read/write CF_UNICODETEXT. Handles are kept pointer-wide
+# (c_void_p) so nothing is truncated on 64-bit.
+# --------------------------------------------------------------------------- #
+def _clip_get() -> str | None:
+    if platform.system() != "Windows":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u32, k32 = ctypes.windll.user32, ctypes.windll.kernel32
+        u32.OpenClipboard.argtypes = [ctypes.c_void_p]
+        u32.GetClipboardData.restype = ctypes.c_void_p
+        u32.GetClipboardData.argtypes = [wintypes.UINT]
+        k32.GlobalLock.restype = ctypes.c_void_p
+        k32.GlobalLock.argtypes = [ctypes.c_void_p]
+        k32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+        if not u32.OpenClipboard(None):
+            return None
+        try:
+            h = u32.GetClipboardData(13)  # CF_UNICODETEXT
+            if not h:
+                return None
+            p = k32.GlobalLock(h)
+            if not p:
+                return None
+            try:
+                return ctypes.c_wchar_p(p).value
+            finally:
+                k32.GlobalUnlock(h)
+        finally:
+            u32.CloseClipboard()
+    except Exception:
+        return None
+
+
+def _clip_set(text: str) -> bool:
+    if platform.system() != "Windows":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u32, k32 = ctypes.windll.user32, ctypes.windll.kernel32
+        u32.OpenClipboard.argtypes = [ctypes.c_void_p]
+        u32.SetClipboardData.restype = ctypes.c_void_p
+        u32.SetClipboardData.argtypes = [wintypes.UINT, ctypes.c_void_p]
+        k32.GlobalAlloc.restype = ctypes.c_void_p
+        k32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+        k32.GlobalLock.restype = ctypes.c_void_p
+        k32.GlobalLock.argtypes = [ctypes.c_void_p]
+        k32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+        k32.GlobalFree.argtypes = [ctypes.c_void_p]
+        data = text.encode("utf-16-le") + b"\x00\x00"
+        h = k32.GlobalAlloc(0x0002, len(data))  # GMEM_MOVEABLE
+        if not h:
+            return False
+        p = k32.GlobalLock(h)
+        if not p:
+            k32.GlobalFree(h)
+            return False
+        ctypes.memmove(p, data, len(data))
+        k32.GlobalUnlock(h)
+        if not u32.OpenClipboard(None):
+            k32.GlobalFree(h)
+            return False
+        try:
+            u32.EmptyClipboard()
+            if not u32.SetClipboardData(13, h):  # CF_UNICODETEXT
+                k32.GlobalFree(h)
+                return False
+            return True  # the clipboard owns the memory now
+        finally:
+            u32.CloseClipboard()
+    except Exception:
+        return False
 
 
 # --------------------------------------------------------------------------- #
@@ -201,7 +287,7 @@ def _attach_input_desktop(state: dict) -> None:
 
 
 def _inject(ev: dict, state: dict) -> None:
-    """Inject one mouse/keyboard event via pynput (runs in the helper)."""
+    """Inject one mouse/keyboard/clipboard event (runs in the helper)."""
     try:
         # On Windows, make sure this thread is on the desktop that currently owns
         # input before injecting, so events reach the login/lock screen too.
@@ -252,6 +338,25 @@ def _inject(ev: dict, state: dict) -> None:
                 kb.press(k)
             for k in reversed(keys):
                 kb.release(k)
+        elif kind == "clip_paste":
+            # Put the text on the remote clipboard, then paste it.
+            from pynput.keyboard import Controller as KC, Key
+            kb = state.get("keyboard") or KC()
+            state["keyboard"] = kb
+            if _clip_set(ev.get("text", "")):
+                kb.press(Key.ctrl); kb.press("v"); kb.release("v"); kb.release(Key.ctrl)
+            else:
+                kb.type(ev.get("text", ""))  # fallback: type it
+        elif kind == "clip_get":
+            txt = _clip_get()
+            sock, lock = state.get("sock"), state.get("sendlock")
+            if sock is not None and txt:
+                blob = _CLIP_MAGIC + txt.encode("utf-8")
+                if lock is not None:
+                    with lock:
+                        _send_msg(sock, blob)
+                else:
+                    _send_msg(sock, blob)
     except Exception:
         pass
 
@@ -325,7 +430,8 @@ class ScreenSession:
                 self._fail("capture helper authentication failed")
                 return
             self._sock = conn
-            # Read frames until stopped or the helper disconnects.
+            # Relay helper -> viewer until stopped or the helper disconnects. Both
+            # JPEG frames and the LRMMCLIP clipboard blob are forwarded as binary.
             while not self._stop:
                 frame = _recv_msg(conn)
                 if frame is None:
@@ -449,7 +555,7 @@ class ScreenSession:
 # Helper process (runs in the interactive/console session).
 # --------------------------------------------------------------------------- #
 def _capture_loop(s, fps: int, quality: int, stop: threading.Event,
-                  geom: dict | None = None) -> None:
+                  geom: dict | None = None, send_lock: threading.Lock | None = None) -> None:
     """Grab the screen and stream JPEG frames until ``stop`` is set or the socket
     drops. On Windows it follows the active input desktop so it keeps working
     across the secure-desktop switch, downscales big frames, and survives the odd
@@ -460,6 +566,13 @@ def _capture_loop(s, fps: int, quality: int, stop: threading.Event,
     frames = 0
     fails = 0
     reason = "stopped"
+
+    def _send(data: bytes) -> bool:
+        if send_lock is not None:
+            with send_lock:
+                return _send_msg(s, data)
+        return _send_msg(s, data)
+
     try:
         import time
         import mss
@@ -516,7 +629,7 @@ def _capture_loop(s, fps: int, quality: int, stop: threading.Event,
                 time.sleep(0.2)
                 continue
             fails = 0
-            if not _send_msg(s, data):
+            if not _send(data):
                 reason = "viewer/socket closed"
                 break
             frames += 1
@@ -653,10 +766,13 @@ def run_screen_helper(argv) -> None:
         return
 
     stop = threading.Event()
+    send_lock = threading.Lock()
     # Shared geometry (downscale factor + monitor origin) so the input thread can
-    # map viewer coordinates back to native pixels.
+    # map viewer coordinates back to native pixels; sock + sendlock let the input
+    # thread ship a clipboard reply without interleaving with frame sends.
     geom = {"scale": 1.0, "left": 0, "top": 0}
-    inj_state = {"mouse": None, "keyboard": None, "geom": geom}
+    inj_state = {"mouse": None, "keyboard": None, "geom": geom,
+                 "sock": s, "sendlock": send_lock}
 
     def _input_reader():
         while not stop.is_set():
@@ -677,14 +793,14 @@ def run_screen_helper(argv) -> None:
     show_banner = mode == "user" and platform.system() == "Windows"
     _hlog(f"consent banner {'enabled' if show_banner else 'disabled'} for this session")
     if show_banner:
-        cap = threading.Thread(target=_capture_loop, args=(s, fps, quality, stop, geom),
-                               daemon=True)
+        cap = threading.Thread(target=_capture_loop,
+                               args=(s, fps, quality, stop, geom, send_lock), daemon=True)
         cap.start()
         _show_consent_banner(stop)
         stop.set()
         cap.join(timeout=5)
     else:
-        _capture_loop(s, fps, quality, stop, geom)
+        _capture_loop(s, fps, quality, stop, geom, send_lock)
     _hlog("helper exiting")
 
     try:
