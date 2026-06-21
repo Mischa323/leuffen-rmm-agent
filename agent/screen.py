@@ -832,8 +832,41 @@ def run_screen_helper(argv) -> None:
         pass
 
 
+def _ensure_software_sas() -> bool:
+    """Allow a SYSTEM service to generate the Secure Attention Sequence.
+
+    ``SendSAS(asUser=False)`` is *silently ignored* unless the SoftwareSASGeneration
+    policy permits services — which Windows does not enable by default, so the
+    Ctrl+Alt+Del button appears to do nothing (notably on the Server login screen).
+    The SYSTEM agent can set this itself; it takes effect without a reboot.
+
+    Bit values: 1 = Services, 2 = Ease-of-Access apps. We OR-in Services and keep
+    any existing bits. Returns True if the policy now permits services."""
+    try:
+        import winreg
+        path = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
+        with winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, path, 0,
+                                winreg.KEY_READ | winreg.KEY_WRITE) as k:
+            try:
+                cur = int(winreg.QueryValueEx(k, "SoftwareSASGeneration")[0])
+            except FileNotFoundError:
+                cur = 0
+            want = cur | 1
+            if want != cur:
+                winreg.SetValueEx(k, "SoftwareSASGeneration", 0, winreg.REG_DWORD, want)
+                _hlog(f"sas: enabled SoftwareSASGeneration ({cur} -> {want})")
+        return True
+    except Exception as exc:
+        _hlog(f"sas: could not set SoftwareSASGeneration (agent not SYSTEM?): {exc}")
+        return False
+
+
 def _send_sas() -> None:
-    """Trigger Ctrl+Alt+Del via the Windows Secure Attention Sequence API."""
+    """Trigger Ctrl+Alt+Del via the Windows Secure Attention Sequence API.
+
+    Requires the agent to run as SYSTEM and the SoftwareSASGeneration policy to
+    permit services (enabled on demand by :func:`_ensure_software_sas`)."""
+    _ensure_software_sas()
     ps = (
         "Add-Type -TypeDefinition '"
         "using System; using System.Runtime.InteropServices; "
@@ -842,9 +875,14 @@ def _send_sas() -> None:
         "}'; [SAS]::SendSAS($false)"
     )
     try:
-        subprocess.run(
+        r = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
             capture_output=True, timeout=8,
         )
-    except Exception:
-        pass
+        if r.returncode != 0:
+            err = (r.stderr or b"").decode("utf-8", "replace").strip()
+            _hlog(f"sas: SendSAS rc={r.returncode} {err[:200]}")
+        else:
+            _hlog("sas: SendSAS invoked")
+    except Exception as exc:
+        _hlog(f"sas: SendSAS failed: {exc}")
