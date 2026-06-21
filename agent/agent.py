@@ -59,7 +59,8 @@ def _data_dir() -> str:
 def _load_config() -> dict:
     """Config precedence: env vars > bundled rmm_config.json."""
     cfg = {"server_url": os.environ.get("RMM_SERVER_URL"),
-           "api_key": os.environ.get("RMM_API_KEY")}
+           "api_key": os.environ.get("RMM_API_KEY"),
+           "fingerprint": os.environ.get("RMM_SERVER_FINGERPRINT")}
     path = os.path.join(_data_dir(), "rmm_config.json")
     if os.path.exists(path):
         try:
@@ -68,6 +69,7 @@ def _load_config() -> dict:
             cfg["server_url"] = cfg["server_url"] or filecfg.get("server_url")
             cfg["api_key"] = cfg["api_key"] or filecfg.get("api_key")
             cfg["insecure_tls"] = cfg.get("insecure_tls", filecfg.get("insecure_tls", False))
+            cfg["fingerprint"] = cfg["fingerprint"] or filecfg.get("server_fingerprint")
         except Exception:
             pass
     cfg["interval"] = float(os.environ.get("RMM_INTERVAL", "30"))
@@ -81,6 +83,9 @@ def _load_config() -> dict:
     if su and not su.startswith(("http://", "https://")):
         su = "https://" + su
     cfg["server_url"] = su.rstrip("/") or None
+    # Normalise the cert pin (hex, colons/case optional) so it survives the file
+    # round-trip and matches what _verify_pin compares against.
+    cfg["fingerprint"] = (cfg.get("fingerprint") or "").replace(":", "").strip().lower() or None
     return cfg
 
 
@@ -95,6 +100,8 @@ def _persist_config(cfg: dict) -> None:
     path = os.path.join(_data_dir(), "rmm_config.json")
     want = {"server_url": cfg["server_url"], "api_key": cfg["api_key"],
             "insecure_tls": bool(cfg.get("insecure_tls"))}
+    if cfg.get("fingerprint"):
+        want["server_fingerprint"] = cfg["fingerprint"]
     try:
         if os.path.exists(path):
             with open(path) as f:
@@ -253,13 +260,16 @@ class Agent:
         return ctx
 
     def _verify_pin(self, ws) -> None:
-        """Pin the server's TLS certificate when ``RMM_SERVER_FINGERPRINT`` is set.
+        """Pin the server's TLS certificate when a fingerprint is configured.
 
-        The value is the SHA-256 of the server cert (DER), hex, colons optional.
-        When set, only that exact certificate is accepted -- so a self-signed /
-        ``insecure_tls`` deployment is still safe against man-in-the-middle,
-        because an attacker's substituted cert won't match the pin."""
-        pin = (os.environ.get("RMM_SERVER_FINGERPRINT", "") or "").replace(":", "").strip().lower()
+        The pin comes from ``RMM_SERVER_FINGERPRINT`` or the ``server_fingerprint``
+        key in ``rmm_config.json`` (resolved into ``cfg['fingerprint']`` by
+        ``_load_config``). The value is the SHA-256 of the server cert (DER), hex,
+        colons optional. When set, only that exact certificate is accepted -- so a
+        self-signed / ``insecure_tls`` deployment is still safe against
+        man-in-the-middle, because an attacker's substituted cert won't match the
+        pin."""
+        pin = (self.cfg.get("fingerprint") or "").replace(":", "").strip().lower()
         if not pin:
             return
         try:
