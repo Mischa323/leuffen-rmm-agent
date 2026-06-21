@@ -25,51 +25,71 @@ def installed_software() -> list[dict]:
 
 
 def _software_windows() -> list[dict]:
-    import json as _json
-    # Include HKLM (machine-wide), WOW6432Node (32-bit on 64-bit OS), and every
-    # loaded user hive under HKU (catches user-installed apps even when the agent
-    # runs as SYSTEM, where HKCU is the system account with no installs).
-    ps = r"""
-$uninstall = 'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
-$paths = @(
-    "HKLM:\$uninstall\*",
-    "HKLM:\SOFTWARE\WOW6432Node\$uninstall\*"
-)
-# Add each loaded user hive (HKU\<SID>) that isn't a system/service account.
-Get-ChildItem HKU:\ -ErrorAction SilentlyContinue | ForEach-Object {
-    $sid = $_.PSChildName
-    if ($sid -notmatch '^S-1-5-18|^S-1-5-19|^S-1-5-20|_Classes$') {
-        $paths += "HKU:\$sid\$uninstall\*"
-        $paths += "HKU:\$sid\SOFTWARE\WOW6432Node\$uninstall\*"
-    }
-}
-# Mount HKU: drive if not already present.
-if (-not (Get-PSDrive HKU -ErrorAction SilentlyContinue)) {
-    New-PSDrive -PSProvider Registry -Name HKU -Root HKEY_USERS | Out-Null
-}
-Get-ItemProperty $paths -ErrorAction SilentlyContinue |
-    Where-Object { $_.DisplayName -and -not $_.SystemComponent } |
-    Select-Object @{n='name';e={$_.DisplayName}},
-                  @{n='version';e={$_.DisplayVersion}},
-                  @{n='publisher';e={$_.Publisher}} |
-    Sort-Object name -Unique |
-    ConvertTo-Json -Compress -AsArray
-"""
+    """Read installed programs straight from the uninstall registry via winreg.
+
+    Deliberately avoids PowerShell: Windows PowerShell 5.1 (the default on
+    Windows 10/11) rejects ``ConvertTo-Json -AsArray``, which made the old scan
+    error out and report zero programs. Covers HKLM in both the 64- and 32-bit
+    views, plus every loaded user hive under HKU so user-installed apps appear
+    even though the agent runs as SYSTEM (where HKCU is the system account)."""
+    import winreg
+
+    uninstall = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+    seen: dict[tuple, dict] = {}
+
+    def _scan(root, subkey, flag):
+        try:
+            base = winreg.OpenKey(root, subkey, 0, winreg.KEY_READ | flag)
+        except OSError:
+            return
+        try:
+            for i in range(winreg.QueryInfoKey(base)[0]):
+                try:
+                    child = winreg.EnumKey(base, i)
+                    with winreg.OpenKey(base, child, 0, winreg.KEY_READ | flag) as k:
+                        def _val(name):
+                            try:
+                                return winreg.QueryValueEx(k, name)[0]
+                            except OSError:
+                                return None
+                        dn = _val("DisplayName")
+                        if not dn or _val("SystemComponent") == 1:
+                            continue
+                        ver = _val("DisplayVersion")
+                        pub = _val("Publisher")
+                        key = (str(dn), str(ver or ""))
+                        if key not in seen:
+                            seen[key] = {
+                                "name": str(dn),
+                                "version": str(ver) if ver is not None else None,
+                                "publisher": str(pub) if pub else None,
+                            }
+                except OSError:
+                    continue
+        finally:
+            winreg.CloseKey(base)
+
+    # HKLM — explicit 64- and 32-bit views so it works regardless of the agent's
+    # own bitness (the 32-bit view is the WOW6432Node uninstall key).
+    for flag in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
+        _scan(winreg.HKEY_LOCAL_MACHINE, uninstall, flag)
+
+    # Per-user hives loaded under HKU (skip system/service accounts and _Classes).
     try:
-        out = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-            capture_output=True, text=True, timeout=90,
-        )
-        raw = (out.stdout or "").strip()
-        if not raw:
-            return []
-        data = _json.loads(raw)
-        if isinstance(data, dict):
-            data = [data]
-        return [{"name": d.get("name"), "version": d.get("version"), "publisher": d.get("publisher")}
-                for d in data if d.get("name")]
-    except Exception:
-        return []
+        users = winreg.OpenKey(winreg.HKEY_USERS, "")
+        try:
+            for i in range(winreg.QueryInfoKey(users)[0]):
+                sid = winreg.EnumKey(users, i)
+                if sid.endswith("_Classes") or sid in (".DEFAULT", "S-1-5-18", "S-1-5-19", "S-1-5-20"):
+                    continue
+                for flag in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
+                    _scan(winreg.HKEY_USERS, sid + "\\" + uninstall, flag)
+        finally:
+            winreg.CloseKey(users)
+    except OSError:
+        pass
+
+    return sorted(seen.values(), key=lambda d: (d["name"] or "").lower())
 
 
 def _software_linux() -> list[dict]:
