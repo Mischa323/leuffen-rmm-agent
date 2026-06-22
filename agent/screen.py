@@ -364,9 +364,12 @@ def _inject(ev: dict, state: dict) -> None:
 
 class ScreenSession:
     def __init__(self, send_bytes, fps: int = 4, quality: int = 50,
-                 max_edge: int = 1600, on_error=None):
+                 max_edge: int = 1600, on_error=None, purpose: str = "control"):
         self.send_bytes = send_bytes
         self.on_error = on_error
+        # 'control' = interactive remote session (shows the consent banner);
+        # 'screenshot' = one-shot still grabbed by the dashboard (no banner).
+        self.purpose = purpose or "control"
         self.fps = max(1, min(fps, 24))
         self.quality = max(10, min(quality, 90))
         try:
@@ -473,8 +476,12 @@ class ScreenSession:
         else:
             script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent.py")
             prefix = f'"{sys.executable}" "{script}"'
-        # Args after base: <mode> <max_edge>.
-        tail = f"user {self.max_edge}"
+        # Args after base: <mode> <max_edge>. A 'screenshot' session runs the
+        # helper without the consent banner (it's a single still, not an ongoing
+        # session); a normal 'control' session shows the banner in the user's
+        # session ('user' mode).
+        mode = "screenshot" if self.purpose == "screenshot" else "user"
+        tail = f"{mode} {self.max_edge}"
         # Launch as SYSTEM in the console session FIRST. Only a SYSTEM process can
         # attach to the secure Winlogon desktop (lock screen / sign-in), so this is
         # the path that makes the login screen work -- and it also captures the
@@ -757,8 +764,9 @@ def run_screen_helper(argv) -> None:
 
     Launched by the SYSTEM agent as
     ``agent.exe --screen-helper <port> <token> <fps> <quality> [mode] [max_edge]``
-    where ``mode`` is ``user`` (interactive session; shows the consent banner) or
-    ``system`` (console session, e.g. the login/lock screen; no banner).
+    where ``mode`` is ``user`` (interactive remote session; shows the consent
+    banner), ``screenshot`` (one-shot still grabbed by the dashboard; no banner),
+    or ``system`` (console session, e.g. the login/lock screen; no banner).
     """
     try:
         i = argv.index("--screen-helper")
@@ -811,7 +819,8 @@ def run_screen_helper(argv) -> None:
 
     # In a real user session, run capture in a background thread and give the
     # main thread to the consent banner (Tk must own the main thread). Otherwise
-    # (login/lock screen) just capture on the main thread -- no user to notify.
+    # (login/lock screen, or a one-shot 'screenshot') just capture on the main
+    # thread -- no banner is shown.
     show_banner = mode == "user" and platform.system() == "Windows"
     _hlog(f"consent banner {'enabled' if show_banner else 'disabled'} for this session")
     if show_banner:
