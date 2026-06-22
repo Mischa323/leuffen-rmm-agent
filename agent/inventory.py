@@ -227,30 +227,52 @@ def _hardware_linux() -> dict:
                 return f.read().strip()
         except Exception:
             return None
+    cpu = None
+    try:
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if line.lower().startswith("model name"):
+                    cpu = line.split(":", 1)[1].strip()
+                    break
+    except Exception:
+        pass
     return {
         "manufacturer": read("/sys/class/dmi/id/sys_vendor"),
         "model": read("/sys/class/dmi/id/product_name"),
         "serial": read("/sys/class/dmi/id/product_serial"),
+        "cpu": cpu,
     }
 
 
 def _hardware_windows() -> dict:
-    info = {"manufacturer": None, "model": None, "serial": None, "is_server": False}
+    info = {"manufacturer": None, "model": None, "serial": None,
+            "is_server": False, "cpu": None}
     try:
+        # Emit labelled lines so parsing stays correct even when a field is blank
+        # (a plain ordered list shifts indices when, e.g., the serial is empty).
         out = subprocess.run(
             ["powershell", "-NoProfile", "-Command",
              "$c=Get-CimInstance Win32_ComputerSystem; $b=Get-CimInstance Win32_BIOS; "
-             "$o=Get-CimInstance Win32_OperatingSystem; "
-             "Write-Output $c.Manufacturer; Write-Output $c.Model; "
-             "Write-Output $b.SerialNumber; Write-Output $o.ProductType"],
+             "$o=Get-CimInstance Win32_OperatingSystem; $p=@(Get-CimInstance Win32_Processor)[0]; "
+             "Write-Output ('MFR=' + $c.Manufacturer); Write-Output ('MODEL=' + $c.Model); "
+             "Write-Output ('SERIAL=' + $b.SerialNumber); Write-Output ('PTYPE=' + $o.ProductType); "
+             "Write-Output ('CPU=' + $p.Name)"],
             capture_output=True, text=True, timeout=15,
         )
-        lines = [l.strip() for l in out.stdout.splitlines() if l.strip()]
-        if len(lines) >= 3:
-            info["manufacturer"], info["model"], info["serial"] = lines[0], lines[1], lines[2]
-        if len(lines) >= 4:
-            # ProductType: 1=workstation, 2=domain controller, 3=server
-            info["is_server"] = lines[3] in ("2", "3")
+        vals: dict[str, str] = {}
+        for line in out.stdout.splitlines():
+            if "=" in line:
+                key, _, val = line.partition("=")
+                vals[key.strip()] = val.strip()
+        info["manufacturer"] = vals.get("MFR") or None
+        info["model"] = vals.get("MODEL") or None
+        info["serial"] = vals.get("SERIAL") or None
+        # ProductType: 1=workstation, 2=domain controller, 3=server
+        info["is_server"] = vals.get("PTYPE") in ("2", "3")
+        # Win32_Processor.Name is the marketing name ("AMD Ryzen 5 5600X 6-Core
+        # Processor"); collapse the padding WMI leaves in it.
+        if vals.get("CPU"):
+            info["cpu"] = " ".join(vals["CPU"].split())
     except Exception:
         pass
     return info
@@ -274,7 +296,7 @@ def collect() -> dict:
         "fqdn": socket.getfqdn(),
         "logged_in_user": _logged_in_user(),
         "agent_version": AGENT_VERSION,
-        "cpu": platform.processor() or platform.machine(),
+        "cpu": hw.get("cpu") or platform.processor() or platform.machine(),
         "cpu_cores_logical": psutil.cpu_count(),
         "cpu_cores_physical": psutil.cpu_count(logical=False),
         "ram_total": ram_total,

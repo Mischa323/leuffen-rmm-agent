@@ -16,7 +16,9 @@ import hmac
 import json
 import logging
 import os
+import shutil
 import socket
+import subprocess
 import sys
 import time
 import uuid
@@ -213,6 +215,164 @@ def _collect_metrics() -> dict:
     }
 
 
+# --- Optional sensors (GPU / temperature) -------------------------------------
+# These can shell out to nvidia-smi / powershell, so they're collected off the
+# event loop and throttled. Capability flags are probed once and cached so we
+# don't keep spawning probes on hardware that can't answer (None=unprobed).
+_sensor_caps: dict[str, bool | None] = {"nvidia": None, "win_gpu": None, "win_cputemp": None}
+_sensor_cache: dict[str, object] = {"ts": 0.0, "data": {}}
+SENSOR_MIN_INTERVAL = 25.0  # seconds; bounds the cost of probe subprocesses
+
+
+def _run(cmd: list[str], timeout: float) -> str:
+    """Run a short probe command, returning stdout ('' on any failure)."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.stdout or ""
+    except Exception:
+        return ""
+
+
+def _win_gpu_counter() -> float | None:
+    # ToString(InvariantCulture) so a non-English locale doesn't emit "30,8".
+    txt = _run(["powershell", "-NoProfile", "-Command",
+                "$s=(Get-Counter '\\GPU Engine(*)\\Utilization Percentage' "
+                "-ErrorAction Stop).CounterSamples | "
+                "Measure-Object -Property CookedValue -Sum; "
+                "([math]::Round($s.Sum,1)).ToString([Globalization.CultureInfo]::InvariantCulture)"], 12).strip()
+    if not txt:
+        return None
+    try:
+        return min(round(float(txt.replace(",", ".")), 1), 100.0)
+    except ValueError:
+        return None
+
+
+def _gpu_stats() -> dict:
+    """Best-effort GPU utilisation / temperature / VRAM. NVIDIA is fully covered
+    via nvidia-smi on any OS; other vendors get utilisation only (Linux sysfs or
+    Windows GPU performance counters), with temperature left as None."""
+    out = {"gpu_percent": None, "gpu_temp": None, "gpu_mem_percent": None}
+    if _sensor_caps["nvidia"] is None:
+        _sensor_caps["nvidia"] = bool(shutil.which("nvidia-smi"))
+    if _sensor_caps["nvidia"]:
+        txt = _run(["nvidia-smi",
+                    "--query-gpu=utilization.gpu,temperature.gpu,memory.used,memory.total",
+                    "--format=csv,noheader,nounits"], 8)
+        best = None  # report the busiest GPU on multi-GPU hosts
+        for line in txt.splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 4:
+                continue
+            try:
+                util, temp, used, total = (float(parts[0]), float(parts[1]),
+                                           float(parts[2]), float(parts[3]))
+            except ValueError:
+                continue
+            mem = (used / total * 100) if total else None
+            if best is None or util > best[0]:
+                best = (util, temp, mem)
+        if best:
+            out["gpu_percent"] = round(best[0], 1)
+            out["gpu_temp"] = round(best[1], 1)
+            out["gpu_mem_percent"] = round(best[2], 1) if best[2] is not None else None
+            return out
+    if os.name != "nt":
+        # AMD on Linux exposes utilisation via sysfs; cheap file read, no process.
+        try:
+            import glob
+            vals = []
+            for path in glob.glob("/sys/class/drm/card*/device/gpu_busy_percent"):
+                try:
+                    with open(path) as f:
+                        vals.append(float(f.read().strip()))
+                except Exception:
+                    pass
+            if vals:
+                out["gpu_percent"] = round(max(vals), 1)
+        except Exception:
+            pass
+        return out
+    # Windows, non-NVIDIA: aggregate the GPU Engine performance counters. Covers
+    # AMD/Intel/NVIDIA, but the counter path is English-locale only, so treat a
+    # first empty result as "unsupported" and stop probing.
+    if _sensor_caps["win_gpu"] is not False:
+        pct = _win_gpu_counter()
+        if pct is not None:
+            _sensor_caps["win_gpu"] = True
+            out["gpu_percent"] = pct
+        elif _sensor_caps["win_gpu"] is None:
+            _sensor_caps["win_gpu"] = False
+    return out
+
+
+def _win_thermal_zone() -> float | None:
+    txt = _run(["powershell", "-NoProfile", "-Command",
+                "$t=Get-CimInstance -Namespace root/WMI "
+                "-ClassName MSAcpi_ThermalZoneTemperature -ErrorAction Stop | "
+                "Select-Object -ExpandProperty CurrentTemperature; "
+                "if($t){(([math]::Round((($t|Measure-Object -Maximum).Maximum/10)-273.15,1)))"
+                ".ToString([Globalization.CultureInfo]::InvariantCulture)}"], 12).strip()
+    if not txt:
+        return None
+    try:
+        c = float(txt.replace(",", "."))
+    except ValueError:
+        return None
+    return c if 0 < c < 150 else None
+
+
+def _cpu_temp() -> float | None:
+    """CPU temperature in °C. psutil covers Linux; Windows falls back to the ACPI
+    thermal zone via WMI, which many machines simply don't expose."""
+    try:
+        read = getattr(psutil, "sensors_temperatures", None)
+        if read:
+            temps = read()
+            for key in ("coretemp", "k10temp", "zenpower", "cpu_thermal", "acpitz"):
+                entries = temps.get(key)
+                if entries:
+                    pkg = [e.current for e in entries
+                           if e.label and "package" in e.label.lower() and e.current]
+                    vals = pkg or [e.current for e in entries if e.current]
+                    if vals:
+                        return round(max(vals), 1)
+            allvals = [e.current for v in temps.values() for e in v if e.current]
+            if allvals:
+                return round(max(allvals), 1)
+    except Exception:
+        pass
+    if os.name == "nt" and _sensor_caps["win_cputemp"] is not False:
+        t = _win_thermal_zone()
+        if t is not None:
+            _sensor_caps["win_cputemp"] = True
+            return t
+        if _sensor_caps["win_cputemp"] is None:
+            _sensor_caps["win_cputemp"] = False
+    return None
+
+
+def _collect_sensors() -> dict:
+    """GPU + temperature probe, throttled and meant to run off the event loop
+    (it may shell out). Returns cached values between refreshes."""
+    now = time.time()
+    cached = _sensor_cache.get("data") or {}
+    if cached and now - float(_sensor_cache.get("ts") or 0) < SENSOR_MIN_INTERVAL:
+        return dict(cached)  # type: ignore[arg-type]
+    data = {"gpu_percent": None, "gpu_temp": None, "gpu_mem_percent": None, "cpu_temp": None}
+    try:
+        data.update(_gpu_stats())
+    except Exception:
+        pass
+    try:
+        data["cpu_temp"] = _cpu_temp()
+    except Exception:
+        pass
+    _sensor_cache["ts"] = now
+    _sensor_cache["data"] = data
+    return data
+
+
 def _status_path() -> str:
     return os.path.join(_data_dir(), "status.json")
 
@@ -311,9 +471,20 @@ class Agent:
     async def _sync_now(self) -> None:
         """Force an immediate push of inventory + metrics (used by the tray)."""
         await self._register()
-        await self._send({"type": "metrics", "metrics": _collect_metrics()})
+        await self._send({"type": "metrics", "metrics": await self._metrics_with_sensors()})
         self.last_sync = time.time()
         self._write_status(True)
+
+    async def _metrics_with_sensors(self) -> dict:
+        """Cheap psutil metrics plus the optional GPU/temperature probe, which is
+        run in a thread so its subprocesses never block the event loop."""
+        m = _collect_metrics()
+        try:
+            loop = asyncio.get_event_loop()
+            m.update(await loop.run_in_executor(None, _collect_sensors))
+        except Exception:
+            pass
+        return m
 
     async def _control_loop(self) -> None:
         """Watch for a sync-request flag dropped by the tray app."""
@@ -350,7 +521,7 @@ class Agent:
         while True:
             await asyncio.sleep(self.cfg["interval"])
             try:
-                await self._send({"type": "metrics", "metrics": _collect_metrics()})
+                await self._send({"type": "metrics", "metrics": await self._metrics_with_sensors()})
                 self.last_sync = time.time()
                 self._write_status(True)
             except Exception:
