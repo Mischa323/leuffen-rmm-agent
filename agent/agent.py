@@ -219,7 +219,8 @@ def _collect_metrics() -> dict:
 # These can shell out to nvidia-smi / powershell, so they're collected off the
 # event loop and throttled. Capability flags are probed once and cached so we
 # don't keep spawning probes on hardware that can't answer (None=unprobed).
-_sensor_caps: dict[str, bool | None] = {"nvidia": None, "win_gpu": None, "win_cputemp": None}
+_sensor_caps: dict[str, bool | None] = {"nvidia": None, "win_gpu": None,
+                                        "win_cputemp": None, "hyperv": None}
 _sensor_cache: dict[str, object] = {"ts": 0.0, "data": {}}
 SENSOR_MIN_INTERVAL = 25.0  # seconds; bounds the cost of probe subprocesses
 
@@ -352,9 +353,61 @@ def _cpu_temp() -> float | None:
     return None
 
 
+# Outputs 'NOHV' when the Hyper-V role/module is absent; otherwise a compact JSON
+# object {present, vms:[...]}. The Get-VM guard avoids loading the module on hosts
+# that don't have it. ConvertTo-Json (no -AsArray, which is PS7-only) may collapse
+# a single VM to an object, so the Python side normalises that.
+_HYPERV_PS = (
+    "if(-not (Get-Command Get-VM -ErrorAction SilentlyContinue)){'NOHV';return};"
+    "$vms=@(Get-VM | ForEach-Object { [pscustomobject]@{"
+    "name=$_.Name; state=$_.State.ToString(); cpu=[int]$_.CPUUsage;"
+    "mem_assigned=[int64]$_.MemoryAssigned; mem_demand=[int64]$_.MemoryDemand;"
+    "uptime=[int64]$_.Uptime.TotalSeconds; vcpu=[int]$_.ProcessorCount;"
+    "status=[string]$_.Status} });"
+    "[pscustomobject]@{present=$true; vms=$vms} | ConvertTo-Json -Depth 4 -Compress"
+)
+
+
+def _hyperv_stats() -> dict | None:
+    """Hyper-V host summary + per-VM usage (Windows only). None when the role
+    isn't present; capability is probed once and then skipped."""
+    if os.name != "nt" or _sensor_caps["hyperv"] is False:
+        return None
+    txt = _run(["powershell", "-NoProfile", "-Command", _HYPERV_PS], 30).strip()
+    if not txt or txt == "NOHV":
+        if _sensor_caps["hyperv"] is None:
+            _sensor_caps["hyperv"] = False
+        return None
+    try:
+        import json as _json
+        data = _json.loads(txt)
+    except Exception:
+        return None
+    if not isinstance(data, dict) or not data.get("present"):
+        _sensor_caps["hyperv"] = False
+        return None
+    _sensor_caps["hyperv"] = True
+    raw = data.get("vms")
+    items = [raw] if isinstance(raw, dict) else (raw if isinstance(raw, list) else [])
+    vms, running = [], 0
+    for vm in items:
+        if not isinstance(vm, dict):
+            continue
+        state = str(vm.get("state") or "")
+        if state.lower() == "running":
+            running += 1
+        vms.append({"name": vm.get("name"), "state": state, "cpu": vm.get("cpu"),
+                    "mem_assigned": vm.get("mem_assigned"), "mem_demand": vm.get("mem_demand"),
+                    "uptime": vm.get("uptime"), "vcpu": vm.get("vcpu"),
+                    "status": vm.get("status")})
+    # Running VMs first, then alphabetical.
+    vms.sort(key=lambda v: (v["state"].lower() != "running", (v.get("name") or "").lower()))
+    return {"present": True, "total": len(vms), "running": running, "vms": vms}
+
+
 def _collect_sensors() -> dict:
-    """GPU + temperature probe, throttled and meant to run off the event loop
-    (it may shell out). Returns cached values between refreshes."""
+    """GPU + temperature + Hyper-V probe, throttled and meant to run off the event
+    loop (it may shell out). Returns cached values between refreshes."""
     now = time.time()
     cached = _sensor_cache.get("data") or {}
     if cached and now - float(_sensor_cache.get("ts") or 0) < SENSOR_MIN_INTERVAL:
@@ -366,6 +419,12 @@ def _collect_sensors() -> dict:
         pass
     try:
         data["cpu_temp"] = _cpu_temp()
+    except Exception:
+        pass
+    try:
+        hv = _hyperv_stats()
+        if hv is not None:
+            data["hyperv"] = hv
     except Exception:
         pass
     _sensor_cache["ts"] = now
