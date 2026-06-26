@@ -1,16 +1,22 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Leuffen RMM agent MSI (WiX v4). Built in CI on a Windows runner around the
-  PyInstaller exe. Configured at install time via properties, e.g.:
+  Leuffen RMM agent MSI (WiX v5). Built in CI on a Windows runner around the
+  PyInstaller *onedir* output. Configured at install time via properties, e.g.:
 
     msiexec /i leuffen-rmm-agent.msi /qn ^
       RMM_SERVER_URL=https://rmm.example.com:8000 ^
       RMM_API_KEY=<org enrolment key> ^
       RMM_INSECURE_TLS=1
 
-  It installs the exe to Program Files, persists the settings as machine
-  environment variables, and registers a scheduled task that runs the agent at
-  startup as SYSTEM. Uninstall removes the task.
+  It installs the agent (a folder: the exe plus its _internal payload) and the
+  tray exe to Program Files, persists the settings as machine environment
+  variables, registers a scheduled task that runs the agent at startup as
+  SYSTEM, and adds a Microsoft Defender exclusion for the install folder.
+
+  The agent is built with PyInstaller onedir (not onefile): a self-extracting
+  onefile exe is the single biggest trigger for Defender's Bearfoos.B!ml
+  machine-learning false positive on PyInstaller apps, so we ship a plain folder
+  and additionally exclude it. Uninstall removes the task and the exclusion.
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
   <Package Name="Leuffen RMM Agent" Manufacturer="Leuffen IT"
@@ -32,30 +38,52 @@
     <Property Id="RMM_INSECURE_TLS" Value="1" Secure="yes" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
-      <Directory Id="INSTALLFOLDER" Name="LeuffenRMM">
-        <Component Id="AgentExe" Guid="b1d4e2a0-3c55-4f6b-8a17-9e2d4c6b0a31">
-          <File Id="agentexe" Source="leuffen-rmm-agent.exe" KeyPath="yes" />
-          <Environment Id="EnvUrl" Name="RMM_SERVER_URL" Value="[RMM_SERVER_URL]"
-                       Action="set" Part="all" System="yes" Permanent="no" />
-          <Environment Id="EnvKey" Name="RMM_API_KEY" Value="[RMM_API_KEY]"
-                       Action="set" Part="all" System="yes" Permanent="no" />
-          <Environment Id="EnvInsec" Name="RMM_INSECURE_TLS" Value="[RMM_INSECURE_TLS]"
-                       Action="set" Part="all" System="yes" Permanent="no" />
-        </Component>
-        <!-- Per-user system-tray companion: autostarts at logon in the user's session. -->
-        <Component Id="TrayExe" Guid="c2e5f3b1-4d66-4a7c-9b28-1f3e5d7c2b42">
-          <File Id="trayexe" Source="leuffen-rmm-tray.exe" KeyPath="yes" />
-          <RegistryValue Root="HKLM" Key="Software\Microsoft\Windows\CurrentVersion\Run"
-                         Name="LeuffenRMMTray" Type="string"
-                         Value="&quot;[INSTALLFOLDER]leuffen-rmm-tray.exe&quot;" />
-        </Component>
-      </Directory>
+      <Directory Id="INSTALLFOLDER" Name="LeuffenRMM" />
     </StandardDirectory>
 
+    <!-- The PyInstaller onedir payload (agent exe + _internal\*) and the tray
+         exe are staged into packaging\windows\app in CI and harvested here, so
+         the whole folder tree is installed without listing each file. -->
+    <ComponentGroup Id="AgentFiles" Directory="INSTALLFOLDER">
+      <Files Include="app\**" />
+    </ComponentGroup>
+
+    <!-- Machine env vars + tray autostart live in their own registry-keyed
+         components (decoupled from the harvested files above). -->
+    <DirectoryRef Id="INSTALLFOLDER">
+      <Component Id="EnvVars" Guid="b1d4e2a0-3c55-4f6b-8a17-9e2d4c6b0a31">
+        <RegistryValue Root="HKLM" Key="Software\LeuffenRMM" Name="Installed" Type="integer" Value="1" KeyPath="yes" />
+        <Environment Id="EnvUrl" Name="RMM_SERVER_URL" Value="[RMM_SERVER_URL]"
+                     Action="set" Part="all" System="yes" Permanent="no" />
+        <Environment Id="EnvKey" Name="RMM_API_KEY" Value="[RMM_API_KEY]"
+                     Action="set" Part="all" System="yes" Permanent="no" />
+        <Environment Id="EnvInsec" Name="RMM_INSECURE_TLS" Value="[RMM_INSECURE_TLS]"
+                     Action="set" Part="all" System="yes" Permanent="no" />
+      </Component>
+      <!-- Per-user system-tray companion: autostarts at logon in the user's session. -->
+      <Component Id="TrayAutostart" Guid="c2e5f3b1-4d66-4a7c-9b28-1f3e5d7c2b42">
+        <RegistryValue Root="HKLM" Key="Software\Microsoft\Windows\CurrentVersion\Run"
+                       Name="LeuffenRMMTray" Type="string"
+                       Value="&quot;[INSTALLFOLDER]leuffen-rmm-tray.exe&quot;" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
     <Feature Id="Main">
-      <ComponentRef Id="AgentExe" />
-      <ComponentRef Id="TrayExe" />
+      <ComponentGroupRef Id="AgentFiles" />
+      <ComponentRef Id="EnvVars" />
+      <ComponentRef Id="TrayAutostart" />
     </Feature>
+
+    <!-- Defender exclusion for the install folder + agent/tray processes. The
+         agent exe is a known-good first-party binary that Defender's ML model
+         (Bearfoos.B!ml) flags as a false positive; the exclusion stops it being
+         quarantined. Added before files are written so it's in place on write.
+         Best-effort: Return="ignore" and SilentlyContinue so a machine with
+         Tamper Protection on (where the cmdlet is blocked) still installs. -->
+    <CustomAction Id="AddDefenderExclusion" Directory="INSTALLFOLDER" Impersonate="no" Execute="deferred" Return="ignore"
+      ExeCommand="powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -Command &quot;Add-MpPreference -ExclusionPath '[INSTALLFOLDER]' -ErrorAction SilentlyContinue; Add-MpPreference -ExclusionProcess 'leuffen-rmm-agent.exe' -ErrorAction SilentlyContinue; Add-MpPreference -ExclusionProcess 'leuffen-rmm-tray.exe' -ErrorAction SilentlyContinue&quot;" />
+    <CustomAction Id="RemoveDefenderExclusion" Directory="INSTALLFOLDER" Impersonate="no" Execute="deferred" Return="ignore"
+      ExeCommand="powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -Command &quot;Remove-MpPreference -ExclusionPath '[INSTALLFOLDER]' -ErrorAction SilentlyContinue; Remove-MpPreference -ExclusionProcess 'leuffen-rmm-agent.exe' -ErrorAction SilentlyContinue; Remove-MpPreference -ExclusionProcess 'leuffen-rmm-tray.exe' -ErrorAction SilentlyContinue&quot;" />
 
     <!-- Scheduled task: run the agent at startup as SYSTEM with highest rights. -->
     <CustomAction Id="CreateTask" Directory="INSTALLFOLDER" Impersonate="no" Execute="deferred" Return="ignore"
@@ -67,13 +95,15 @@
 
     <!-- After an interactive install, open the configuration dialog (server URL + key).
          Skipped for silent installs (msiexec /qn passes config via properties). -->
-    <CustomAction Id="LaunchConfig" FileRef="trayexe" ExeCommand="--settings"
-      Execute="immediate" Return="asyncNoWait" Impersonate="yes" />
+    <CustomAction Id="LaunchConfig" Directory="INSTALLFOLDER" Impersonate="yes" Execute="immediate" Return="asyncNoWait"
+      ExeCommand="&quot;[INSTALLFOLDER]leuffen-rmm-tray.exe&quot; --settings" />
 
     <InstallExecuteSequence>
+      <Custom Action="AddDefenderExclusion" Before="InstallFiles" Condition="NOT Installed" />
       <Custom Action="CreateTask" After="InstallFiles" Condition="NOT Installed" />
       <Custom Action="StartTask" After="CreateTask" Condition="NOT Installed" />
       <Custom Action="DeleteTask" Before="RemoveFiles" Condition="REMOVE=&quot;ALL&quot;" />
+      <Custom Action="RemoveDefenderExclusion" After="DeleteTask" Condition="REMOVE=&quot;ALL&quot;" />
       <Custom Action="LaunchConfig" After="InstallFinalize" Condition="NOT Installed AND UILevel &gt; 3" />
     </InstallExecuteSequence>
   </Package>
