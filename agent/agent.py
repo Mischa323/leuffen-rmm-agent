@@ -307,25 +307,86 @@ def _gpu_stats() -> dict:
     return out
 
 
-def _win_thermal_zone() -> float | None:
-    txt = _run(["powershell", "-NoProfile", "-Command",
-                "$t=Get-CimInstance -Namespace root/WMI "
-                "-ClassName MSAcpi_ThermalZoneTemperature -ErrorAction Stop | "
-                "Select-Object -ExpandProperty CurrentTemperature; "
-                "if($t){(([math]::Round((($t|Measure-Object -Maximum).Maximum/10)-273.15,1)))"
-                ".ToString([Globalization.CultureInfo]::InvariantCulture)}"], 12).strip()
+# LibreHardwareMonitor reads the real CPU die temperature on Windows (the same
+# Digital Thermal Sensor HWMonitor uses). It needs its bundled managed DLLs and
+# loads an embedded kernel driver on Open(), which requires SYSTEM (the agent is).
+# The old ACPI thermal-zone reading is gone — it reported a different, often-bogus
+# sensor. If LHM can't load (DLL missing, driver blocked by HVCI), CPU temp is N/A.
+_lhm_cache: dict[str, object] = {"ts": 0.0, "val": None, "ttl": 0.0}
+_LHM_TTL = 60.0          # refresh interval for a working sensor (driver load isn't free)
+_LHM_BACKOFF = 1800.0    # retry interval where LHM can't load, so we don't poll constantly
+
+_LHM_PS = (
+    "$ErrorActionPreference='Stop'; $d=$env:LHM_DIR;"
+    "Add-Type -Path (Join-Path $d 'HidSharp.dll') -ErrorAction SilentlyContinue;"
+    "Add-Type -Path (Join-Path $d 'LibreHardwareMonitorLib.dll');"
+    "$c=New-Object LibreHardwareMonitor.Hardware.Computer; $c.IsCpuEnabled=$true; $c.Open();"
+    "$o=@(); foreach($h in $c.Hardware){ $h.Update(); foreach($s in $h.Sensors){"
+    "  if($s.SensorType -eq 'Temperature' -and $null -ne $s.Value){"
+    "    $o+=[pscustomobject]@{name=[string]$s.Name;"
+    "      value=([double]$s.Value).ToString([Globalization.CultureInfo]::InvariantCulture)} } } }"
+    "$c.Close(); $o | ConvertTo-Json -Compress"
+)
+
+
+def _lhm_dll_dir() -> str | None:
+    """Directory holding LibreHardwareMonitorLib.dll: the PyInstaller bundle when
+    frozen, else a vendored folder beside the agent (dev / source installs)."""
+    for d in (getattr(sys, "_MEIPASS", None), os.path.join(HERE, "vendor"), HERE):
+        if d and os.path.exists(os.path.join(d, "LibreHardwareMonitorLib.dll")):
+            return d
+    return None
+
+
+def _select_cpu_temp(sensors: list) -> float | None:
+    """Most representative CPU temperature from LHM's sensors: Intel 'CPU Package'
+    / AMD 'Core (Tctl/Tdie)' first, then a core max, then the hottest reading."""
+    vals = []
+    for s in sensors:
+        if not isinstance(s, dict):
+            continue
+        try:
+            vals.append((str(s.get("name") or "").lower(),
+                         float(str(s.get("value")).replace(",", "."))))
+        except (TypeError, ValueError):
+            pass
+    if not vals:
+        return None
+    def pick(pred):
+        m = [v for n, v in vals if pred(n)]
+        return max(m) if m else None
+    return (pick(lambda n: "package" in n)
+            or pick(lambda n: "tctl" in n or "tdie" in n)
+            or pick(lambda n: "max" in n)
+            or max(v for _, v in vals))
+
+
+def _win_lhm_cpu_temp() -> float | None:
+    d = _lhm_dll_dir()
+    if not d:
+        return None
+    env = dict(os.environ); env["LHM_DIR"] = d
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                            "-Command", _LHM_PS], capture_output=True, text=True,
+                           timeout=30, env=env)
+        txt = (r.stdout or "").strip()
+    except Exception:
+        return None
     if not txt:
         return None
     try:
-        c = float(txt.replace(",", "."))
-    except ValueError:
+        import json as _json
+        data = _json.loads(txt)
+    except Exception:
         return None
-    return c if 0 < c < 150 else None
+    t = _select_cpu_temp(data if isinstance(data, list) else [data])
+    return round(t, 1) if t is not None and 0 < t < 150 else None
 
 
 def _cpu_temp() -> float | None:
-    """CPU temperature in °C. psutil covers Linux; Windows falls back to the ACPI
-    thermal zone via WMI, which many machines simply don't expose."""
+    """CPU temperature in °C. psutil hardware sensors on Linux; the CPU die sensor
+    via LibreHardwareMonitor on Windows (cached, since opening it loads a driver)."""
     try:
         read = getattr(psutil, "sensors_temperatures", None)
         if read:
@@ -343,13 +404,16 @@ def _cpu_temp() -> float | None:
                 return round(max(allvals), 1)
     except Exception:
         pass
-    if os.name == "nt" and _sensor_caps["win_cputemp"] is not False:
-        t = _win_thermal_zone()
-        if t is not None:
-            _sensor_caps["win_cputemp"] = True
-            return t
-        if _sensor_caps["win_cputemp"] is None:
-            _sensor_caps["win_cputemp"] = False
+    if os.name == "nt":
+        now = time.time()
+        ttl = float(_lhm_cache.get("ttl") or _LHM_TTL)
+        if _lhm_cache.get("ts") and now - float(_lhm_cache["ts"]) < ttl:  # type: ignore[arg-type]
+            return _lhm_cache["val"]  # type: ignore[return-value]
+        t = _win_lhm_cpu_temp()
+        _lhm_cache["ts"] = now
+        _lhm_cache["val"] = t
+        _lhm_cache["ttl"] = _LHM_TTL if t is not None else _LHM_BACKOFF
+        return t
     return None
 
 
