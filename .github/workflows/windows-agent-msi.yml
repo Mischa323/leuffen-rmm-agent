@@ -49,9 +49,32 @@ jobs:
         # The .ico is drawn programmatically (no binary committed to the repo).
         run: python packaging/windows/make_icon.py
 
+      - name: Fetch LibreHardwareMonitor (accurate Windows CPU temps)
+        # Bundled into the exe so the agent can read the CPU die sensor (the DLL
+        # carries an embedded kernel driver). Pulled at build time from NuGet so
+        # no binaries are committed to the repo.
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tmp = Join-Path $env:RUNNER_TEMP 'lhm'
+          New-Item -ItemType Directory -Force $tmp | Out-Null
+          function Fetch($url, $name, $match) {
+            $zip = Join-Path $tmp "$name.zip"
+            Invoke-WebRequest -Uri $url -OutFile $zip
+            $dest = Join-Path $tmp $name
+            Expand-Archive -Path $zip -DestinationPath $dest -Force
+            $dll = Get-ChildItem $dest -Recurse -Filter "$name.dll" |
+                   Where-Object { $_.FullName -match $match } | Select-Object -First 1
+            if (-not $dll) { throw "Could not find $name.dll ($match) in package" }
+            Copy-Item $dll.FullName (Join-Path 'packaging\windows' "$name.dll") -Force
+            Write-Host "bundled $name.dll <- $($dll.FullName)"
+          }
+          Fetch 'https://www.nuget.org/api/v2/package/LibreHardwareMonitorLib/0.9.4' 'LibreHardwareMonitorLib' 'net472'
+          Fetch 'https://www.nuget.org/api/v2/package/HidSharp/2.1.0' 'HidSharp' 'net35'
+
       - name: Build agent exe
         working-directory: agent
-        run: pyinstaller --onefile --noconsole --icon ..\packaging\windows\leuffen.ico --name leuffen-rmm-agent --paths . --collect-submodules mss --collect-submodules pynput --hidden-import PIL.Image agent.py
+        run: pyinstaller --onefile --noconsole --icon ..\packaging\windows\leuffen.ico --name leuffen-rmm-agent --paths . --collect-submodules mss --collect-submodules pynput --hidden-import PIL.Image --add-data "..\packaging\windows\LibreHardwareMonitorLib.dll;." --add-data "..\packaging\windows\HidSharp.dll;." agent.py
 
       - name: Build tray exe
         working-directory: agent
