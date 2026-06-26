@@ -72,9 +72,18 @@ jobs:
           Fetch 'https://www.nuget.org/api/v2/package/LibreHardwareMonitorLib/0.9.4' 'LibreHardwareMonitorLib' 'net472'
           Fetch 'https://www.nuget.org/api/v2/package/HidSharp/2.1.0' 'HidSharp' 'net35'
 
+      - name: Fetch MAC vendor database (accurate network-scan vendor names)
+        # Bundled so node scans can name device vendors without nmap installed.
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/nmap/nmap/master/nmap-mac-prefixes' `
+            -OutFile 'packaging\windows\nmap-mac-prefixes'
+          Write-Host "bundled nmap-mac-prefixes ($((Get-Item 'packaging\windows\nmap-mac-prefixes').Length) bytes)"
+
       - name: Build agent exe
         working-directory: agent
-        run: pyinstaller --onefile --noconsole --icon ..\packaging\windows\leuffen.ico --name leuffen-rmm-agent --paths . --collect-submodules mss --collect-submodules pynput --hidden-import PIL.Image --add-data "..\packaging\windows\LibreHardwareMonitorLib.dll;." --add-data "..\packaging\windows\HidSharp.dll;." agent.py
+        run: pyinstaller --onefile --noconsole --icon ..\packaging\windows\leuffen.ico --name leuffen-rmm-agent --paths . --collect-submodules mss --collect-submodules pynput --hidden-import PIL.Image --add-data "..\packaging\windows\LibreHardwareMonitorLib.dll;." --add-data "..\packaging\windows\HidSharp.dll;." --add-data "..\packaging\windows\nmap-mac-prefixes;." agent.py
 
       - name: Build tray exe
         working-directory: agent
