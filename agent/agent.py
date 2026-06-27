@@ -312,6 +312,23 @@ def _gpu_stats() -> dict:
 # loads an embedded kernel driver on Open(), which requires SYSTEM (the agent is).
 # The old ACPI thermal-zone reading is gone — it reported a different, often-bogus
 # sensor. If LHM can't load (DLL missing, driver blocked by HVCI), CPU temp is N/A.
+#
+# OPT-IN: the kernel driver (WinRing0) is on Microsoft's vulnerable-driver
+# blocklist, so Defender removes it. We therefore DON'T load LHM by default — the
+# agent ships clean. The server turns it on per device/org via agent_policy
+# (enable_cpu_temp_driver) only where the operator accepts that tradeoff.
+_cpu_temp_driver_enabled = False
+
+
+def _set_cpu_temp_driver(enabled: bool) -> None:
+    """Toggle the opt-in Windows CPU-die sensor (LibreHardwareMonitor/WinRing0)."""
+    global _cpu_temp_driver_enabled
+    enabled = bool(enabled)
+    if enabled and not _cpu_temp_driver_enabled:
+        _lhm_cache["ts"] = 0.0   # force a fresh read on enable (clear any backoff)
+    _cpu_temp_driver_enabled = enabled
+
+
 _lhm_cache: dict[str, object] = {"ts": 0.0, "val": None, "ttl": 0.0}
 _LHM_TTL = 60.0          # refresh interval for a working sensor (driver load isn't free)
 _LHM_BACKOFF = 1800.0    # retry interval where LHM can't load, so we don't poll constantly
@@ -405,6 +422,8 @@ def _cpu_temp() -> float | None:
     except Exception:
         pass
     if os.name == "nt":
+        if not _cpu_temp_driver_enabled:
+            return None   # opt-in only — the LHM/WinRing0 driver is off by default
         now = time.time()
         ttl = float(_lhm_cache.get("ttl") or _LHM_TTL)
         if _lhm_cache.get("ts") and now - float(_lhm_cache["ts"]) < ttl:  # type: ignore[arg-type]
@@ -684,6 +703,8 @@ class Agent:
                     _set_fast_startup(enabled=False)    # keep NIC powered on shutdown
                 else:
                     _set_fast_startup(enabled=True)     # restore Windows default
+            if "enable_cpu_temp_driver" in msg:
+                _set_cpu_temp_driver(msg.get("enable_cpu_temp_driver"))
         elif t == "shell_run":
             res = await handlers.run_command(msg.get("cmd", ""))
             await self._ack(rid, res)
