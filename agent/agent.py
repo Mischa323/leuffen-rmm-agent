@@ -29,6 +29,7 @@ import websockets
 import handlers
 import inventory
 import netscan
+import snmp
 import updater
 from screen import ScreenSession
 
@@ -223,6 +224,25 @@ _sensor_caps: dict[str, bool | None] = {"nvidia": None, "win_gpu": None,
                                         "win_cputemp": None, "hyperv": None}
 _sensor_cache: dict[str, object] = {"ts": 0.0, "data": {}}
 SENSOR_MIN_INTERVAL = 25.0  # seconds; bounds the cost of probe subprocesses
+SNMP_TICK = 10.0            # node SNMP poll-loop granularity (per-target intervals)
+
+
+def _snmp_poll_target(t: dict) -> dict:
+    """Poll one SNMP target's OIDs (blocking; runs in an executor). Returns an
+    'snmp_result' message with one reading per OID."""
+    oids_cfg = t.get("oids") or []
+    oids = [o.get("oid") for o in oids_cfg if o.get("oid")]
+    labels = {o.get("oid"): o.get("label") for o in oids_cfg}
+    res = snmp.get(t.get("host", ""), t.get("community") or "public", oids,
+                   version=t.get("version") or "2c", port=int(t.get("port") or 161),
+                   timeout=float(t.get("timeout") or 2.0), retries=1)
+    readings = []
+    for oid, value, tname in res.get("varbinds", []):
+        num = value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+        readings.append({"oid": oid, "label": labels.get(oid),
+                         "value": value, "num": num, "type": tname})
+    return {"type": "snmp_result", "target_id": t.get("id"), "ok": res.get("ok", False),
+            "error": res.get("error"), "readings": readings}
 
 
 def _run(cmd: list[str], timeout: float) -> str:
@@ -529,6 +549,7 @@ class Agent:
         self.id = _device_id()
         self.role = "agent"
         self.subnets: list[str] = []
+        self.snmp_targets: list[dict] = []
         self.ws = None
         self.screen: ScreenSession | None = None
         self.last_sync: float | None = None
@@ -603,7 +624,7 @@ class Agent:
                     self._write_status(True)
                     backoff = 2
                     await asyncio.gather(self._metrics_loop(), self._recv_loop(),
-                                         self._control_loop())
+                                         self._control_loop(), self._snmp_loop())
             except Exception as exc:
                 log.warning("connection lost (%s); retrying in %ss", exc, backoff)
                 self._write_status(False)
@@ -689,7 +710,10 @@ class Agent:
         if t == "set_role":
             self.role = msg.get("role", "agent")
             self.subnets = msg.get("subnets", [])
-            log.info("role set to %s, subnets=%s", self.role, self.subnets)
+            if "snmp_targets" in msg:
+                self.snmp_targets = msg.get("snmp_targets") or []
+            log.info("role set to %s, subnets=%s, snmp_targets=%d",
+                     self.role, self.subnets, len(self.snmp_targets))
         elif t == "device_secret":
             # Server-issued per-device secret (trust-on-first-use); persist it so
             # subsequent reconnects can prove this device's identity.
@@ -748,6 +772,15 @@ class Agent:
             asyncio.create_task(self._self_update(msg, rid))
         elif t == "scan":
             asyncio.create_task(self._do_scan(msg.get("subnets") or self.subnets))
+        elif t == "snmp_config":
+            self.snmp_targets = msg.get("targets") or []
+            log.info("snmp_config: %d target(s)", len(self.snmp_targets))
+        elif t == "snmp_poll":
+            # On-demand poll of one target (or all) regardless of interval.
+            tid = msg.get("target_id")
+            for tg in list(self.snmp_targets):
+                if tid is None or tg.get("id") == tid:
+                    asyncio.create_task(self._poll_snmp_target(tg))
         elif t == "screen_start":
             await self._screen_start(msg)
         elif t == "screen_stop":
@@ -775,6 +808,29 @@ class Agent:
         log.info("scanning %s", subnets)
         hosts = await netscan.scan(subnets)
         await self._send({"type": "scan_result", "hosts": hosts})
+
+    async def _snmp_loop(self) -> None:
+        """Poll configured SNMP targets (node only) at each target's interval."""
+        last: dict = {}
+        while True:
+            await asyncio.sleep(SNMP_TICK)
+            if self.role != "node" or not self.snmp_targets:
+                continue
+            now = time.time()
+            for t in list(self.snmp_targets):
+                tid = t.get("id")
+                interval = max(int(t.get("interval") or 300), 30)
+                if now - last.get(tid, 0.0) >= interval:
+                    last[tid] = now
+                    asyncio.create_task(self._poll_snmp_target(t))
+
+    async def _poll_snmp_target(self, t: dict) -> None:
+        try:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, _snmp_poll_target, t)
+            await self._send(result)
+        except Exception as exc:
+            log.warning("snmp poll failed for %s: %s", t.get("host"), exc)
 
     async def _screen_start(self, msg: dict) -> None:
         if self.screen:
