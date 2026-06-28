@@ -5,6 +5,13 @@ Windows agent source, packaging, and CI for the Leuffen RMM platform.
 See `agent/` for the agent source, `packaging/windows/` for the MSI packaging,
 and `.github/workflows/` for the build/release pipelines.
 
+For **Synology DSM**, `agent/syno_agent.py` + `agent/syno_inventory.py` are a
+self-contained, pure-stdlib variant (no psutil/websockets — it implements the
+WebSocket client itself and reads `/proc` + DSM CLIs). It's shipped as a `noarch`
+Synology package: `packaging/synology/` holds the `INFO`/scripts/`conf`, and the
+RMM server assembles the `.spk` on demand and serves it through a Package Center
+*package source* (no separate release/CI step).
+
 ## Configuration
 
 The agent reads its settings from environment variables first, then from

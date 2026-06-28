@@ -1,0 +1,3 @@
+#!/bin/sh
+# DSM stops the package (start-stop-status stop) before uninstall; nothing extra.
+exit 0
