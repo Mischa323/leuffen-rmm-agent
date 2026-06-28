@@ -1,0 +1,27 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Leuffen RMM</title>
+<style>
+body{font-family:system-ui,Segoe UI,Arial,sans-serif;background:#0f172a;color:#e2e8f0;
+     display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
+.box{text-align:center}
+a{color:#60a5fa}
+</style>
+</head>
+<body>
+<div class="box">
+  <p>Opening the Leuffen RMM agent status &amp; log…</p>
+  <p>If it doesn't open, go to <a id="link"></a></p>
+</div>
+<script>
+// The agent serves its status/log page on port 5388 on this NAS. Redirect there
+// (top-level navigation, so http works even when DSM is opened over https).
+var url = "http://" + location.hostname + ":5388/";
+var a = document.getElementById("link");
+a.href = url; a.textContent = url;
+location.replace(url);
+</script>
+</body>
+</html>
