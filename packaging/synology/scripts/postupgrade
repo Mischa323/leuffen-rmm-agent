@@ -1,25 +1,17 @@
 #!/bin/sh
-# Must ALWAYS exit 0 — a non-zero postinst aborts the DSM install. DSM 7 may run
-# install scripts unprivileged and under `set -e`, so disable errexit and make
-# every step best-effort.
+# Runs after an upgrade (DSM uses preupgrade/postupgrade instead of pre/postinst).
+# Re-apply the same best-effort setup as postinst. Must always exit 0.
 set +e
 PKG="LeuffenRMM"
 TARGET="${SYNOPKG_PKGDEST:-/var/packages/${PKG}/target}"
 VAR="${SYNOPKG_PKGVAR:-/var/packages/${PKG}/var}"
 
-# Move the baked enrolment config into the persistent writable area so the agent
-# connects with no manual setup and survives upgrades.
 mkdir -p "${VAR}" 2>/dev/null
 if [ -f "${TARGET}/rmm_config.json" ]; then
     cp -f "${TARGET}/rmm_config.json" "${VAR}/rmm_config.json" 2>/dev/null
     chmod 600 "${VAR}/rmm_config.json" 2>/dev/null
 fi
 
-# Best-effort root grant so the agent can run as root (Active Backup via
-# synowebapi, reboot, remote shell). Only attempted when this script can actually
-# write sudoers — DSM 7 usually runs install scripts unprivileged, in which case
-# the agent runs as the package user and reports core metrics; enabling root is a
-# manual admin step (see README).
 if [ -d /etc/sudoers.d ] && [ -w /etc/sudoers.d ]; then
     for u in "${SYNOPKG_PKGNAME}" "${PKG}"; do
         [ -n "$u" ] || continue

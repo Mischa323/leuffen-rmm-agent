@@ -1,0 +1,4 @@
+#!/bin/sh
+# Runs before an upgrade. Nothing to do — must always exit 0.
+set +e
+exit 0
