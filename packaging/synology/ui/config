@@ -1,0 +1,13 @@
+{
+    ".url": {
+        "SYNO.SDS.LeuffenRMM.Application": {
+            "type": "url",
+            "allUsers": true,
+            "title": "Leuffen RMM",
+            "desc": "Agent status and log",
+            "icon": "images/icon_{0}.png",
+            "url": "/webman/3rdparty/LeuffenRMM/index.html",
+            "urlTarget": "_blank"
+        }
+    }
+}
