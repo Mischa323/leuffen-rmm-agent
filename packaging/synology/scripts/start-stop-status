@@ -16,11 +16,18 @@ LOG="${VAR}/agent.log"
 export RMM_DATA_DIR="${VAR}"
 
 find_python() {
+    # Any installed DSM Python 3 package works (official Python3.9, or a
+    # SynoCommunity Python3.10+). Names/paths vary, so probe PATH then the
+    # package dirs, matching both "python3" and versioned "python3.N".
     for p in python3 /usr/local/bin/python3 /usr/bin/python3; do
         if command -v "$p" >/dev/null 2>&1; then echo "$p"; return; fi
     done
     for p in /var/packages/Python3*/target/usr/bin/python3 \
-             /var/packages/Python3*/target/bin/python3; do
+             /var/packages/Python3*/target/bin/python3 \
+             /var/packages/Python3*/target/usr/bin/python3.[0-9] \
+             /var/packages/Python3*/target/usr/bin/python3.[0-9][0-9] \
+             /var/packages/Python3*/target/bin/python3.[0-9] \
+             /var/packages/Python3*/target/bin/python3.[0-9][0-9]; do
         [ -x "$p" ] && { echo "$p"; return; }
     done
     echo ""
