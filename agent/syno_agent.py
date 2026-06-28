@@ -15,9 +15,12 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import html
+import http.server
 import json
 import logging
 import os
+import re
 import socket
 import ssl
 import struct
@@ -349,6 +352,113 @@ def _power(action: str) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Local status + log web UI (DSM app)
+# --------------------------------------------------------------------------- #
+# Served on RMM_UI_PORT so it's reachable from the DSM desktop (INFO adminport)
+# even while the agent can't reach the RMM — the place to see why it isn't
+# connecting, without SSH. Started before the connect loop so it's always up.
+_STATUS: dict = {"state": "starting", "detail": "", "server": None,
+                 "device_id": None, "version": syno_inventory.AGENT_VERSION,
+                 "since": time.time(), "last_connect": None}
+_STATUS_LOCK = threading.Lock()
+
+
+def _set_status(**kw) -> None:
+    with _STATUS_LOCK:
+        _STATUS.update(kw)
+
+
+def _log_path() -> str:
+    return os.path.join(_data_dir(), "agent.log")
+
+
+def _read_log_tail(n_lines: int = 400, max_bytes: int = 262144) -> str:
+    try:
+        with open(_log_path(), "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - max_bytes))
+            text = f.read().decode("utf-8", "replace")
+        out = "\n".join(text.splitlines()[-n_lines:])
+        # Never expose the enrolment key if it ever lands in a log line / URL.
+        return re.sub(r'(key=)[^&\s"\']+', r"\1***", out)
+    except Exception as exc:
+        return f"(no log yet: {exc})"
+
+
+_STATE_COLOR = {"connected": "#16a34a", "connecting": "#d97706",
+                "reconnecting": "#d97706", "error": "#dc2626", "starting": "#64748b"}
+
+
+class _UIHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a):  # silence default request logging
+        pass
+
+    def _send(self, body: bytes, ctype: str) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except Exception:
+            pass
+
+    def do_GET(self):
+        if self.path.startswith("/log"):
+            self._send(_read_log_tail(2000).encode("utf-8", "replace"),
+                       "text/plain; charset=utf-8")
+            return
+        with _STATUS_LOCK:
+            st = dict(_STATUS)
+        state = st.get("state", "starting")
+        tone = _STATE_COLOR.get(state, "#64748b")
+        logtxt = html.escape(_read_log_tail(400))
+        server = html.escape(st.get("server") or "(not configured)")
+        detail = html.escape(st.get("detail") or "")
+        dev = html.escape((st.get("device_id") or "")[:16])
+        ver = html.escape(str(st.get("version") or ""))
+        page = (
+            '<!doctype html><html><head><meta charset="utf-8">'
+            '<meta http-equiv="refresh" content="5">'
+            '<title>Leuffen RMM agent</title><style>'
+            'body{font-family:system-ui,Segoe UI,Arial,sans-serif;margin:0;background:#0f172a;color:#e2e8f0}'
+            '.hd{padding:16px 20px;background:#1e293b;display:flex;align-items:center;gap:12px}'
+            '.dot{width:12px;height:12px;border-radius:50%;background:' + tone + '}'
+            '.badge{padding:3px 10px;border-radius:999px;background:' + tone + ';color:#fff;font-size:12px;font-weight:600;text-transform:capitalize}'
+            'h1{font-size:16px;margin:0;font-weight:650}'
+            '.meta{padding:10px 20px;color:#94a3b8;font-size:13px;display:flex;gap:24px;flex-wrap:wrap}'
+            '.meta b{color:#cbd5e1;font-weight:600}'
+            'pre{margin:0;padding:14px 20px;white-space:pre-wrap;word-break:break-word;'
+            'font:12px/1.55 ui-monospace,Consolas,monospace;background:#0b1220}'
+            '</style></head><body>'
+            '<div class="hd"><span class="dot"></span><h1>Leuffen RMM agent</h1>'
+            '<span class="badge">' + html.escape(state) + '</span></div>'
+            '<div class="meta"><span><b>Server:</b> ' + server + '</span>'
+            '<span><b>Device:</b> ' + dev + '</span>'
+            '<span><b>Version:</b> ' + ver + '</span>'
+            + ('<span><b>Detail:</b> ' + detail + '</span>' if detail else '') +
+            '</div><pre>' + logtxt + '</pre></body></html>'
+        )
+        self._send(page.encode("utf-8"), "text/html; charset=utf-8")
+
+
+def _start_status_server() -> None:
+    port = int(os.environ.get("RMM_UI_PORT", "5388"))
+
+    def run():
+        try:
+            srv = http.server.ThreadingHTTPServer(("0.0.0.0", port), _UIHandler)
+        except Exception as exc:
+            log.warning("status UI could not bind port %s: %s", port, exc)
+            return
+        log.info("status UI listening on port %s", port)
+        srv.serve_forever()
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+# --------------------------------------------------------------------------- #
 # Agent
 # --------------------------------------------------------------------------- #
 class Agent:
@@ -363,9 +473,11 @@ class Agent:
         backoff = 2
         while True:
             try:
+                _set_status(state="connecting", detail="")
                 self._session(url)
                 backoff = 2
             except Exception as exc:
+                _set_status(state="reconnecting", detail=str(exc)[:200])
                 log.warning("connection lost (%s); retrying in %ss", exc, backoff)
             time.sleep(backoff)
             backoff = min(backoff * 2, 60)
@@ -375,6 +487,7 @@ class Agent:
                               fingerprint=self.cfg["fingerprint"])
         self.ws = ws
         self._register()
+        _set_status(state="connected", detail="", last_connect=time.time())
         log.info("registered as %s (%s)", socket.gethostname(), self.id)
         stop = threading.Event()
         hb = threading.Thread(target=self._heartbeat, args=(stop,), daemon=True)
@@ -465,10 +578,15 @@ class Agent:
 
 def main() -> int:
     cfg = _load_config()
+    _set_status(server=cfg.get("server_url"), device_id=_device_id(),
+                version=syno_inventory.AGENT_VERSION)
+    _start_status_server()  # local DSM status/log page, up regardless of config
     if not (cfg.get("server_url") and cfg.get("api_key")):
         log.error("missing server_url/api_key — set RMM_SERVER_URL/RMM_API_KEY or "
                   "rmm_config.json in %s", _data_dir())
-        return 2
+        _set_status(state="error", detail="missing server_url/api_key in rmm_config.json")
+        while True:  # stay up so the status page remains viewable on the NAS
+            time.sleep(3600)
     log.info("Leuffen RMM Synology agent v%s starting (server %s)",
              syno_inventory.AGENT_VERSION, cfg["server_url"])
     Agent(cfg).run_forever()
