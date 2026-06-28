@@ -40,15 +40,30 @@ start_daemon() {
         echo "python3 not found (install the Synology Python3 package)" >>"${LOG}"
         exit 1
     fi
-    "${PYTHON}" "${TARGET}/syno_agent.py" >>"${LOG}" 2>&1 &
+    echo "$(date) starting as user=$(id -un 2>/dev/null) python=${PYTHON}" >>"${LOG}"
+    # The package runs as a non-root user (DSM 7 won't install a root package), so
+    # run the agent through sudo when postinst's grant is in place — it needs root
+    # for Active Backup (synowebapi), reboot and remote shell. Without sudo it
+    # still runs and reports core metrics.
+    if sudo -n true 2>/dev/null; then
+        echo "$(date) sudo OK -> running agent as root" >>"${LOG}"
+        sudo -n RMM_DATA_DIR="${VAR}" "${PYTHON}" "${TARGET}/syno_agent.py" >>"${LOG}" 2>&1 &
+    else
+        echo "$(date) no sudo -> running unprivileged (core metrics only)" >>"${LOG}"
+        "${PYTHON}" "${TARGET}/syno_agent.py" >>"${LOG}" 2>&1 &
+    fi
     echo $! > "${PIDFILE}"
 }
 
 stop_daemon() {
     if [ -f "${PIDFILE}" ]; then
-        kill "$(cat "${PIDFILE}")" 2>/dev/null
+        PID="$(cat "${PIDFILE}")"
+        kill "${PID}" 2>/dev/null
+        sudo -n kill "${PID}" 2>/dev/null
         rm -f "${PIDFILE}"
     fi
+    # The agent may be running as root via sudo; make sure it's gone.
+    sudo -n pkill -f "${TARGET}/syno_agent.py" 2>/dev/null || pkill -f "${TARGET}/syno_agent.py" 2>/dev/null
 }
 
 daemon_status() {
