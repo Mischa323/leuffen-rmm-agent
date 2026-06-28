@@ -22,7 +22,7 @@ import time
 
 # Keep in sync with inventory.AGENT_VERSION (single source of truth for the SPK
 # version is inventory.py; this constant is the value the running NAS reports).
-AGENT_VERSION = "2.2.22"
+AGENT_VERSION = "2.2.23"
 
 
 # --------------------------------------------------------------------------- #
