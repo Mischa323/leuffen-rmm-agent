@@ -1,7 +1,7 @@
 package="LeuffenRMM"
 version="__VERSION__"
 os_min_ver="7.0-40000"
-description="Leuffen RMM monitoring agent for Synology NAS. Reports health (CPU, memory, storage, temperature, volume and disk status) to your Leuffen RMM server and enables remote management — the NAS appears alongside your other devices."
+description="Leuffen RMM monitoring agent for Synology NAS. Reports health (CPU, memory, storage, temperature, volume and disk status) to your Leuffen RMM server and enables remote management - the NAS appears alongside your other devices."
 arch="noarch"
 maintainer="Leuffen"
 maintainer_url="https://leuffen.nl"
