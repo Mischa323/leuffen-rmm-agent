@@ -1,7 +1,9 @@
 #!/bin/sh
-# Tidy up runtime files + the sudo grant; DSM removes the package var area itself.
+# Tidy up runtime files + the sudo grant; DSM removes the package area itself.
+# Must always exit 0.
+set +e
 PKG="LeuffenRMM"
 VAR="${SYNOPKG_PKGVAR:-/var/packages/${PKG}/var}"
-rm -f "${VAR}/agent.pid" "${VAR}/agent.log"
-rm -f /etc/sudoers.d/leuffen-rmm
+rm -f "${VAR}/agent.pid" "${VAR}/agent.log" 2>/dev/null
+rm -f /etc/sudoers.d/leuffen-rmm 2>/dev/null
 exit 0
