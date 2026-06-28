@@ -1,0 +1,14 @@
+#!/bin/sh
+# Move the baked enrolment config (server injects rmm_config.json into the
+# package payload at download time) into the persistent writable area so the
+# agent connects with no manual setup and survives upgrades.
+PKG="LeuffenRMM"
+TARGET="${SYNOPKG_PKGDEST:-/var/packages/${PKG}/target}"
+VAR="${SYNOPKG_PKGVAR:-/var/packages/${PKG}/var}"
+
+mkdir -p "${VAR}"
+if [ -f "${TARGET}/rmm_config.json" ]; then
+    cp -f "${TARGET}/rmm_config.json" "${VAR}/rmm_config.json"
+    chmod 600 "${VAR}/rmm_config.json"
+fi
+exit 0

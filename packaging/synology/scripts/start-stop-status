@@ -1,0 +1,66 @@
+#!/bin/sh
+# Leuffen RMM Synology agent — DSM service control (start/stop/status).
+#
+# DSM runs this with the package's environment set: $SYNOPKG_PKGDEST is the
+# install target, $SYNOPKG_PKGVAR the persistent writable area. We launch the
+# pure-stdlib agent with the Synology Python3 interpreter (declared as an
+# install dependency) and keep config + logs in the var area.
+
+PKG="LeuffenRMM"
+TARGET="${SYNOPKG_PKGDEST:-/var/packages/${PKG}/target}"
+VAR="${SYNOPKG_PKGVAR:-/var/packages/${PKG}/var}"
+PIDFILE="${VAR}/agent.pid"
+LOG="${VAR}/agent.log"
+
+# Export so the agent stores device id / config / secret in the persistent area.
+export RMM_DATA_DIR="${VAR}"
+
+find_python() {
+    for p in python3 /usr/local/bin/python3 /usr/bin/python3; do
+        if command -v "$p" >/dev/null 2>&1; then echo "$p"; return; fi
+    done
+    for p in /var/packages/Python3*/target/usr/bin/python3 \
+             /var/packages/Python3*/target/bin/python3; do
+        [ -x "$p" ] && { echo "$p"; return; }
+    done
+    echo ""
+}
+
+start_daemon() {
+    mkdir -p "${VAR}"
+    PYTHON="$(find_python)"
+    if [ -z "${PYTHON}" ]; then
+        echo "python3 not found (install the Synology Python3 package)" >>"${LOG}"
+        exit 1
+    fi
+    "${PYTHON}" "${TARGET}/syno_agent.py" >>"${LOG}" 2>&1 &
+    echo $! > "${PIDFILE}"
+}
+
+stop_daemon() {
+    if [ -f "${PIDFILE}" ]; then
+        kill "$(cat "${PIDFILE}")" 2>/dev/null
+        rm -f "${PIDFILE}"
+    fi
+}
+
+daemon_status() {
+    [ -f "${PIDFILE}" ] && kill -0 "$(cat "${PIDFILE}")" 2>/dev/null
+}
+
+case "$1" in
+    start)
+        daemon_status || start_daemon
+        exit 0
+        ;;
+    stop)
+        stop_daemon
+        exit 0
+        ;;
+    status)
+        if daemon_status; then exit 0; else exit 3; fi
+        ;;
+    *)
+        exit 1
+        ;;
+esac

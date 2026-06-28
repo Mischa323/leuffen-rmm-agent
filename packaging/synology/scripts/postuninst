@@ -1,0 +1,6 @@
+#!/bin/sh
+# Tidy up runtime files; DSM removes the package var area itself.
+PKG="LeuffenRMM"
+VAR="${SYNOPKG_PKGVAR:-/var/packages/${PKG}/var}"
+rm -f "${VAR}/agent.pid" "${VAR}/agent.log"
+exit 0
