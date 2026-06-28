@@ -12,10 +12,12 @@ reports for the dashboard's "agent version".
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import socket
 import subprocess
+import threading
 import time
 
 # Keep in sync with inventory.AGENT_VERSION (single source of truth for the SPK
@@ -417,4 +419,161 @@ def metrics() -> dict:
     if health:
         # Captured for the dashboard; folded under the volume disks for context.
         m["synology"] = {"disks": health}
+    backups = active_backup_cached()
+    if backups:
+        m["backups"] = backups
     return m
+
+
+# --------------------------------------------------------------------------- #
+# Active Backup for Business / Microsoft 365 / Google Workspace
+# --------------------------------------------------------------------------- #
+# DSM keeps each Active Backup package's data in a sandboxed PostgreSQL we can't
+# reach from outside its namespace, so we use Synology's own internal API CLI
+# (synowebapi, root-only) which returns the same JSON the Active Backup UI uses.
+SYNOWEBAPI = "/usr/syno/bin/synowebapi"
+
+# backup_type seen in the wild: 1=VM (Hyper-V/VMware), 2=Personal Computer (agent),
+# 3=Physical Server, 4=File Server. Best-effort labels for display only.
+_ABB_TYPE = {1: "Virtual Machine", 2: "Personal Computer", 3: "Physical Server",
+             4: "File Server", 5: "NAS"}
+
+# Throttle: Active Backup data changes slowly and each refresh makes several
+# synowebapi calls, so refresh off the heartbeat (background thread) and cache.
+_backup_cache: dict = {"t": 0.0, "data": None, "running": False}
+_backup_lock = threading.Lock()
+_BACKUP_TTL = 600.0
+
+
+def _swa(api: str, method: str, version: int, timeout: float = 20.0, **params) -> dict | None:
+    """Call a DSM internal API via synowebapi; return its ``data`` dict or None.
+
+    synowebapi prints ``[Line N] …`` diagnostics around the JSON (and on some
+    builds an extra warning line), so strip those before parsing."""
+    if not os.path.exists(SYNOWEBAPI):
+        return None
+    cmd = [SYNOWEBAPI, "--exec", f"api={api}", f"method={method}", f"version={version}"]
+    for k, v in params.items():
+        cmd.append(f"{k}={v}")
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except Exception:
+        return None
+    text = "\n".join(l for l in (r.stdout or "").splitlines() if not l.lstrip().startswith("[Line"))
+    b = text.find("{")
+    if b < 0:
+        return None
+    try:
+        obj = json.loads(text[b:])
+    except Exception:
+        return None
+    if not obj.get("success"):
+        return None
+    return obj.get("data")
+
+
+def _abb_business() -> dict | None:
+    data = _swa("SYNO.ActiveBackup.Task", "list", 1, timeout=25)
+    if not data:
+        return None
+    tasks = []
+    for t in data.get("tasks", []) or []:
+        tid = t.get("task_id")
+        last_time = last_status = versions = None
+        if tid is not None:
+            vd = _swa("SYNO.ActiveBackup.Version", "list", 1, timeout=20, task_id=tid)
+            if vd:
+                versions = vd.get("total")
+                vlist = vd.get("versions") or []
+                if vlist:
+                    latest = max(vlist, key=lambda v: v.get("time_end") or v.get("time_start") or 0)
+                    last_time = latest.get("time_end") or latest.get("time_start")
+                    last_status = latest.get("status")
+        nxt = t.get("next_trigger_time")
+        tasks.append({
+            "id": tid,
+            "name": t.get("task_name") or (f"Task {tid}" if tid is not None else "Task"),
+            "type": _ABB_TYPE.get(t.get("backup_type"), "Backup"),
+            "devices": t.get("device_count"),
+            "scheduled": bool(nxt and nxt > 0),
+            "next_run": nxt if (nxt and nxt > 0) else None,
+            "running": t.get("running_task_status") is not None,
+            "last_backup": last_time,
+            "last_status": last_status,
+            "versions": versions,
+        })
+    tasks.sort(key=lambda x: (x["name"] or "").lower())
+    return {"tasks": tasks} if tasks else None
+
+
+def _saas_tasks(api: str, pkg_dir: str) -> list[dict] | None:
+    """Microsoft 365 / Google Workspace tasks. Their response groups sub-tasks by
+    service and varies, so walk the structure and pull anything task-shaped."""
+    if not os.path.isdir(pkg_dir):
+        return None
+    data = _swa(api, "list", 1, timeout=25)
+    if not data:
+        return None
+    found: list[dict] = []
+    seen: set = set()
+
+    def walk(o):
+        if isinstance(o, dict):
+            # A real backup task is the object carrying ``task_name`` — don't pull
+            # in the per-user/site/team sub-objects (they have only ``name``).
+            name = o.get("task_name")
+            if name:
+                key = (o.get("task_id"), name)
+                if key not in seen:
+                    seen.add(key)
+                    found.append({"id": o.get("task_id"), "name": name,
+                                  "status": o.get("status")})
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+
+    walk(data)
+    found.sort(key=lambda x: (x["name"] or "").lower())
+    return found or None
+
+
+def active_backup() -> dict | None:
+    """Snapshot of Active Backup tasks (Business + Microsoft 365 + Google)."""
+    out: dict = {}
+    if os.path.isdir("/var/packages/ActiveBackup"):
+        biz = _abb_business()
+        if biz:
+            out["business"] = biz
+    m365 = _saas_tasks("SYNO.ActiveBackupOffice365.Portal.Task",
+                       "/var/packages/ActiveBackup-Office365")
+    if m365:
+        out["microsoft365"] = {"tasks": m365}
+    gsuite = _saas_tasks("SYNO.ActiveBackupGSuite.Portal.Task",
+                         "/var/packages/ActiveBackup-GSuite")
+    if gsuite:
+        out["google"] = {"tasks": gsuite}
+    return out or None
+
+
+def _refresh_backups() -> None:
+    try:
+        data = active_backup()
+    except Exception:
+        data = None
+    with _backup_lock:
+        _backup_cache.update(t=time.time(), data=data, running=False)
+
+
+def active_backup_cached() -> dict | None:
+    """Return the cached Active Backup snapshot, refreshing in the background when
+    stale so the heartbeat never blocks on the (multi-call) collection."""
+    now = time.time()
+    with _backup_lock:
+        c = _backup_cache
+        stale = c["data"] is None or now - c["t"] > _BACKUP_TTL
+        if stale and not c["running"]:
+            c["running"] = True
+            threading.Thread(target=_refresh_backups, daemon=True).start()
+        return c["data"]
