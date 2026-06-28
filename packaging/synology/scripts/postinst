@@ -1,11 +1,30 @@
 #!/bin/sh
-# Move the baked enrolment config (server injects rmm_config.json into the
-# package payload at download time) into the persistent writable area so the
-# agent connects with no manual setup and survives upgrades.
+# Install-time setup (runs as root in DSM).
 PKG="LeuffenRMM"
 TARGET="${SYNOPKG_PKGDEST:-/var/packages/${PKG}/target}"
 VAR="${SYNOPKG_PKGVAR:-/var/packages/${PKG}/var}"
+SUDOERS="/etc/sudoers.d/leuffen-rmm"
 
+# The agent needs root for full RMM function — Active Backup status (synowebapi is
+# root-only), reboot/shutdown, and remote shell. DSM 7 refuses to INSTALL a
+# package that requests root directly, so the package runs as its own non-root
+# user and we grant that user passwordless sudo here (install scripts run as
+# root). If this grant is blocked, the agent still runs unprivileged and reports
+# core metrics — see start-stop-status.
+: > "${SUDOERS}.tmp" 2>/dev/null || true
+for u in "${SYNOPKG_PKGNAME}" "${PKG}" "pkg-${PKG}" "sc-${PKG}"; do
+    [ -n "$u" ] || continue
+    if id "$u" >/dev/null 2>&1; then
+        echo "$u ALL=(ALL) NOPASSWD: ALL" >> "${SUDOERS}.tmp"
+    fi
+done
+if [ -s "${SUDOERS}.tmp" ]; then
+    sort -u "${SUDOERS}.tmp" > "${SUDOERS}" 2>/dev/null && chmod 440 "${SUDOERS}"
+fi
+rm -f "${SUDOERS}.tmp"
+
+# Move the baked enrolment config into the persistent writable area so the agent
+# connects with no manual setup and survives upgrades.
 mkdir -p "${VAR}"
 if [ -f "${TARGET}/rmm_config.json" ]; then
     cp -f "${TARGET}/rmm_config.json" "${VAR}/rmm_config.json"
