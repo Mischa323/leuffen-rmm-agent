@@ -47,7 +47,10 @@ start_daemon() {
     # still runs and reports core metrics.
     if sudo -n true 2>/dev/null; then
         echo "$(date) sudo OK -> running agent as root" >>"${LOG}"
-        sudo -n RMM_DATA_DIR="${VAR}" "${PYTHON}" "${TARGET}/syno_agent.py" >>"${LOG}" 2>&1 &
+        # Pass the data dir via `env` (not `sudo VAR=...`) — sudo's env_reset
+        # refuses command-line variable assignments without a SETENV tag, so
+        # `sudo VAR=x cmd` would fail; `sudo env VAR=x cmd` always works.
+        sudo -n env RMM_DATA_DIR="${VAR}" "${PYTHON}" "${TARGET}/syno_agent.py" >>"${LOG}" 2>&1 &
     else
         echo "$(date) no sudo -> running unprivileged (core metrics only)" >>"${LOG}"
         "${PYTHON}" "${TARGET}/syno_agent.py" >>"${LOG}" 2>&1 &
