@@ -2,26 +2,49 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>Leuffen RMM</title>
+<title>Leuffen RMM agent</title>
 <style>
-body{font-family:system-ui,Segoe UI,Arial,sans-serif;background:#0f172a;color:#e2e8f0;
-     display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
-.box{text-align:center}
-a{color:#60a5fa}
+body{font-family:system-ui,Segoe UI,Arial,sans-serif;margin:0;background:#0f172a;color:#e2e8f0}
+.hd{padding:16px 20px;background:#1e293b;display:flex;align-items:center;gap:12px}
+.dot{width:12px;height:12px;border-radius:50%;background:#64748b}
+.badge{padding:3px 10px;border-radius:999px;background:#64748b;color:#fff;font-size:12px;font-weight:600;text-transform:capitalize}
+h1{font-size:16px;margin:0;font-weight:650}
+.meta{padding:10px 20px;color:#94a3b8;font-size:13px;display:flex;gap:24px;flex-wrap:wrap}
+.meta b{color:#cbd5e1;font-weight:600}
+pre{margin:0;padding:14px 20px;white-space:pre-wrap;word-break:break-word;font:12px/1.55 ui-monospace,Consolas,monospace;background:#0b1220;min-height:40vh}
 </style>
 </head>
 <body>
-<div class="box">
-  <p>Opening the Leuffen RMM agent status &amp; log…</p>
-  <p>If it doesn't open, go to <a id="link"></a></p>
+<div class="hd"><span class="dot" id="dot"></span><h1>Leuffen RMM agent</h1><span class="badge" id="badge">…</span></div>
+<div class="meta">
+  <span><b>Server:</b> <span id="server">—</span></span>
+  <span><b>Device:</b> <span id="device">—</span></span>
+  <span><b>Version:</b> <span id="version">—</span></span>
+  <span id="detailwrap" hidden><b>Detail:</b> <span id="detail"></span></span>
 </div>
+<pre id="log">Loading…</pre>
 <script>
-// The agent serves its status/log page on port 5388 on this NAS. Redirect there
-// (top-level navigation, so http works even when DSM is opened over https).
-var url = "http://" + location.hostname + ":5388/";
-var a = document.getElementById("link");
-a.href = url; a.textContent = url;
-location.replace(url);
+var COLOR = {connected:"#16a34a",connecting:"#d97706",reconnecting:"#d97706",error:"#dc2626",starting:"#64748b"};
+function txt(id,v){document.getElementById(id).textContent=v;}
+async function refresh(){
+  try{
+    var s = await (await fetch("status.json?t="+Date.now(),{cache:"no-store"})).json();
+    var state = s.state || "starting";
+    var c = COLOR[state] || "#64748b";
+    document.getElementById("dot").style.background = c;
+    var b = document.getElementById("badge"); b.textContent = state; b.style.background = c;
+    txt("server", s.server || "(not configured)");
+    txt("device", (s.device_id||"").slice(0,16));
+    txt("version", s.version || "—");
+    var dw = document.getElementById("detailwrap");
+    if(s.detail){ txt("detail", s.detail); dw.hidden=false; } else { dw.hidden=true; }
+  }catch(e){ document.getElementById("badge").textContent="no status yet"; }
+  try{
+    var log = await (await fetch("agent-log.txt?t="+Date.now(),{cache:"no-store"})).text();
+    document.getElementById("log").textContent = log || "(no log yet)";
+  }catch(e){ document.getElementById("log").textContent = "(agent has not written a log yet)"; }
+}
+refresh(); setInterval(refresh, 4000);
 </script>
 </body>
 </html>

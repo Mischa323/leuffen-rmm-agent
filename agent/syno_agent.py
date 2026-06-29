@@ -15,8 +15,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import html
-import http.server
 import json
 import logging
 import os
@@ -352,11 +350,12 @@ def _power(action: str) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# Local status + log web UI (DSM app)
+# Local status + log UI (DSM app, served by DSM — no port)
 # --------------------------------------------------------------------------- #
-# Served on RMM_UI_PORT so it's reachable from the DSM desktop (INFO adminport)
-# even while the agent can't reach the RMM — the place to see why it isn't
-# connecting, without SSH. Started before the connect loop so it's always up.
+# The agent writes status.json + a redacted log tail into its DSM-served ui dir
+# (dsmuidir); the static ui/index.html reads them. DSM serves this authenticated,
+# same-origin at /webman/3rdparty/LeuffenRMM/ — so it's reachable from the DSM
+# desktop even while the agent can't reach the RMM, with no extra port to open.
 _STATUS: dict = {"state": "starting", "detail": "", "server": None,
                  "device_id": None, "version": syno_inventory.AGENT_VERSION,
                  "since": time.time(), "last_connect": None}
@@ -372,7 +371,7 @@ def _log_path() -> str:
     return os.path.join(_data_dir(), "agent.log")
 
 
-def _read_log_tail(n_lines: int = 400, max_bytes: int = 262144) -> str:
+def _read_log_tail(n_lines: int = 600, max_bytes: int = 262144) -> str:
     try:
         with open(_log_path(), "rb") as f:
             f.seek(0, 2)
@@ -386,75 +385,38 @@ def _read_log_tail(n_lines: int = 400, max_bytes: int = 262144) -> str:
         return f"(no log yet: {exc})"
 
 
-_STATE_COLOR = {"connected": "#16a34a", "connecting": "#d97706",
-                "reconnecting": "#d97706", "error": "#dc2626", "starting": "#64748b"}
+def _ui_dir() -> str:
+    return os.path.join(HERE, "ui")
 
 
-class _UIHandler(http.server.BaseHTTPRequestHandler):
-    def log_message(self, *a):  # silence default request logging
+def _write_ui_state() -> None:
+    """Publish status.json + agent-log.txt into the DSM-served ui dir."""
+    d = _ui_dir()
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        return
+    with _STATUS_LOCK:
+        st = dict(_STATUS)
+    try:
+        tmp = os.path.join(d, "status.json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(st, f)
+        os.replace(tmp, os.path.join(d, "status.json"))
+    except Exception:
+        pass
+    try:
+        with open(os.path.join(d, "agent-log.txt"), "w", encoding="utf-8") as f:
+            f.write(_read_log_tail())
+    except Exception:
         pass
 
-    def _send(self, body: bytes, ctype: str) -> None:
-        self.send_response(200)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        try:
-            self.wfile.write(body)
-        except Exception:
-            pass
 
-    def do_GET(self):
-        if self.path.startswith("/log"):
-            self._send(_read_log_tail(2000).encode("utf-8", "replace"),
-                       "text/plain; charset=utf-8")
-            return
-        with _STATUS_LOCK:
-            st = dict(_STATUS)
-        state = st.get("state", "starting")
-        tone = _STATE_COLOR.get(state, "#64748b")
-        logtxt = html.escape(_read_log_tail(400))
-        server = html.escape(st.get("server") or "(not configured)")
-        detail = html.escape(st.get("detail") or "")
-        dev = html.escape((st.get("device_id") or "")[:16])
-        ver = html.escape(str(st.get("version") or ""))
-        page = (
-            '<!doctype html><html><head><meta charset="utf-8">'
-            '<meta http-equiv="refresh" content="5">'
-            '<title>Leuffen RMM agent</title><style>'
-            'body{font-family:system-ui,Segoe UI,Arial,sans-serif;margin:0;background:#0f172a;color:#e2e8f0}'
-            '.hd{padding:16px 20px;background:#1e293b;display:flex;align-items:center;gap:12px}'
-            '.dot{width:12px;height:12px;border-radius:50%;background:' + tone + '}'
-            '.badge{padding:3px 10px;border-radius:999px;background:' + tone + ';color:#fff;font-size:12px;font-weight:600;text-transform:capitalize}'
-            'h1{font-size:16px;margin:0;font-weight:650}'
-            '.meta{padding:10px 20px;color:#94a3b8;font-size:13px;display:flex;gap:24px;flex-wrap:wrap}'
-            '.meta b{color:#cbd5e1;font-weight:600}'
-            'pre{margin:0;padding:14px 20px;white-space:pre-wrap;word-break:break-word;'
-            'font:12px/1.55 ui-monospace,Consolas,monospace;background:#0b1220}'
-            '</style></head><body>'
-            '<div class="hd"><span class="dot"></span><h1>Leuffen RMM agent</h1>'
-            '<span class="badge">' + html.escape(state) + '</span></div>'
-            '<div class="meta"><span><b>Server:</b> ' + server + '</span>'
-            '<span><b>Device:</b> ' + dev + '</span>'
-            '<span><b>Version:</b> ' + ver + '</span>'
-            + ('<span><b>Detail:</b> ' + detail + '</span>' if detail else '') +
-            '</div><pre>' + logtxt + '</pre></body></html>'
-        )
-        self._send(page.encode("utf-8"), "text/html; charset=utf-8")
-
-
-def _start_status_server() -> None:
-    port = int(os.environ.get("RMM_UI_PORT", "5388"))
-
+def _start_status_writer() -> None:
     def run():
-        try:
-            srv = http.server.ThreadingHTTPServer(("0.0.0.0", port), _UIHandler)
-        except Exception as exc:
-            log.warning("status UI could not bind port %s: %s", port, exc)
-            return
-        log.info("status UI listening on port %s", port)
-        srv.serve_forever()
-
+        while True:
+            _write_ui_state()
+            time.sleep(4)
     threading.Thread(target=run, daemon=True).start()
 
 
@@ -580,7 +542,7 @@ def main() -> int:
     cfg = _load_config()
     _set_status(server=cfg.get("server_url"), device_id=_device_id(),
                 version=syno_inventory.AGENT_VERSION)
-    _start_status_server()  # local DSM status/log page, up regardless of config
+    _start_status_writer()  # publish status/log for the DSM app page (no port)
     if not (cfg.get("server_url") and cfg.get("api_key")):
         log.error("missing server_url/api_key — set RMM_SERVER_URL/RMM_API_KEY or "
                   "rmm_config.json in %s", _data_dir())
