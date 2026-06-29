@@ -356,9 +356,20 @@ def _power(action: str) -> dict:
 # (dsmuidir); the static ui/index.html reads them. DSM serves this authenticated,
 # same-origin at /webman/3rdparty/LeuffenRMM/ — so it's reachable from the DSM
 # desktop even while the agent can't reach the RMM, with no extra port to open.
+def _is_privileged() -> bool:
+    """True when the agent runs as root (euid 0) — the prerequisite for Active
+    Backup (synowebapi is mode-700 root-only), reboot and root shell. Fixed for
+    the process lifetime, so it's evaluated once."""
+    try:
+        return os.geteuid() == 0
+    except Exception:
+        return False
+
+
 _STATUS: dict = {"state": "starting", "detail": "", "server": None,
                  "device_id": None, "version": syno_inventory.AGENT_VERSION,
-                 "since": time.time(), "last_connect": None}
+                 "since": time.time(), "last_connect": None,
+                 "privileged": _is_privileged()}
 _STATUS_LOCK = threading.Lock()
 
 
