@@ -2,6 +2,8 @@
 <html>
 <head>
 <meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-store">
+<meta http-equiv="Pragma" content="no-cache">
 <title>Leuffen RMM agent</title>
 <style>
 body{font-family:system-ui,Segoe UI,Arial,sans-serif;margin:0;background:#0f172a;color:#e2e8f0}
@@ -46,7 +48,17 @@ pre{margin:0;padding:14px 20px;white-space:pre-wrap;word-break:break-word;font:1
 <pre id="log">Loading…</pre>
 <script>
 var COLOR = {connected:"#16a34a",connecting:"#d97706",reconnecting:"#d97706",error:"#dc2626",starting:"#64748b"};
-var CMD = "U=$(ps -eo user,args | awk '/[s]yno_agent.py/{print $1; exit}'); echo \"$U ALL=(ALL) NOPASSWD: ALL\" > /etc/sudoers.d/leuffen-rmm && chmod 440 /etc/sudoers.d/leuffen-rmm && synopkg restart LeuffenRMM";
+// Grant by numeric UID — `ps -eo user` truncates names to 8 chars (so a
+// package user like "LeuffenRMM" becomes "LeuffenR+" and the sudoers entry is
+// invalid). The UID never truncates and sudoers accepts the "#uid" form.
+var CMD = `P=$(pgrep -f syno_agent.py | head -n1)
+U=$(awk '/^Uid:/{print $2}' /proc/$P/status 2>/dev/null)
+if [ -z "$U" ]; then echo "Leuffen RMM agent is not running - start the package first."; exit 1; fi
+echo "#$U ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/leuffen-rmm
+chmod 440 /etc/sudoers.d/leuffen-rmm
+echo "Granted root to agent (uid $U). Restarting..."
+synopkg restart LeuffenRMM
+echo "Done - the agent reconnects as root within a minute."`;
 function txt(id,v){document.getElementById(id).textContent=v;}
 document.getElementById("cmd").textContent = CMD;
 document.getElementById("copy").onclick = function(){
