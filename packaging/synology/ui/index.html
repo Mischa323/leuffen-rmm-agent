@@ -9,8 +9,17 @@ body{font-family:system-ui,Segoe UI,Arial,sans-serif;margin:0;background:#0f172a
 .dot{width:12px;height:12px;border-radius:50%;background:#64748b}
 .badge{padding:3px 10px;border-radius:999px;background:#64748b;color:#fff;font-size:12px;font-weight:600;text-transform:capitalize}
 h1{font-size:16px;margin:0;font-weight:650}
-.meta{padding:10px 20px;color:#94a3b8;font-size:13px;display:flex;gap:24px;flex-wrap:wrap}
+.meta{padding:10px 20px;color:#94a3b8;font-size:13px;display:flex;gap:24px;flex-wrap:wrap;align-items:center}
 .meta b{color:#cbd5e1;font-weight:600}
+.pill{padding:2px 9px;border-radius:999px;font-size:12px;font-weight:600}
+.pill.on{background:#14532d;color:#86efac}
+.pill.off{background:#78350f;color:#fcd34d}
+.banner{margin:0 20px 6px;padding:12px 14px;background:#1e293b;border:1px solid #334155;border-left:3px solid #d97706;border-radius:8px;font-size:13px;line-height:1.6}
+.banner h2{font-size:13.5px;margin:0 0 6px;color:#fcd34d}
+.banner ol{margin:6px 0 8px 18px;padding:0}
+.banner code{display:block;white-space:pre-wrap;word-break:break-all;background:#0b1220;color:#e2e8f0;padding:8px 10px;border-radius:6px;font:12px/1.5 ui-monospace,Consolas,monospace}
+.banner button{margin-top:8px;background:#334155;color:#e2e8f0;border:0;padding:6px 12px;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer}
+.banner button:hover{background:#475569}
 pre{margin:0;padding:14px 20px;white-space:pre-wrap;word-break:break-word;font:12px/1.55 ui-monospace,Consolas,monospace;background:#0b1220;min-height:40vh}
 </style>
 </head>
@@ -20,12 +29,30 @@ pre{margin:0;padding:14px 20px;white-space:pre-wrap;word-break:break-word;font:1
   <span><b>Server:</b> <span id="server">—</span></span>
   <span><b>Device:</b> <span id="device">—</span></span>
   <span><b>Version:</b> <span id="version">—</span></span>
+  <span><b>Active Backup &amp; root:</b> <span class="pill off" id="rights">checking…</span></span>
   <span id="detailwrap" hidden><b>Detail:</b> <span id="detail"></span></span>
+</div>
+<div class="banner" id="enable" hidden>
+  <h2>Active Backup &amp; remote reboot are not enabled</h2>
+  <div>DSM 7 reserves root for Synology-signed packages, so the agent runs unprivileged (core metrics only). Grant it once to enable <b>Active Backup monitoring</b>, <b>remote reboot/shutdown</b> and <b>root shell</b>:</div>
+  <ol>
+    <li><b>Control Panel → Task Scheduler → Create → Scheduled Task → User-defined script</b></li>
+    <li>Set <b>User: root</b>; give it any name</li>
+    <li>Paste the command below into <b>Run command</b>, save, then select the task and click <b>Run</b> (delete it afterwards)</li>
+  </ol>
+  <code id="cmd"></code>
+  <button id="copy" type="button">Copy command</button>
 </div>
 <pre id="log">Loading…</pre>
 <script>
 var COLOR = {connected:"#16a34a",connecting:"#d97706",reconnecting:"#d97706",error:"#dc2626",starting:"#64748b"};
+var CMD = "U=$(ps -eo user,args | awk '/[s]yno_agent.py/{print $1; exit}'); echo \"$U ALL=(ALL) NOPASSWD: ALL\" > /etc/sudoers.d/leuffen-rmm && chmod 440 /etc/sudoers.d/leuffen-rmm && synopkg restart LeuffenRMM";
 function txt(id,v){document.getElementById(id).textContent=v;}
+document.getElementById("cmd").textContent = CMD;
+document.getElementById("copy").onclick = function(){
+  navigator.clipboard && navigator.clipboard.writeText(CMD);
+  this.textContent = "Copied"; var b=this; setTimeout(function(){b.textContent="Copy command";},1500);
+};
 async function refresh(){
   try{
     var s = await (await fetch("status.json?t="+Date.now(),{cache:"no-store"})).json();
@@ -36,6 +63,11 @@ async function refresh(){
     txt("server", s.server || "(not configured)");
     txt("device", (s.device_id||"").slice(0,16));
     txt("version", s.version || "—");
+    var priv = !!s.privileged;
+    var r = document.getElementById("rights");
+    r.textContent = priv ? "enabled" : "not enabled";
+    r.className = "pill " + (priv ? "on" : "off");
+    document.getElementById("enable").hidden = priv;
     var dw = document.getElementById("detailwrap");
     if(s.detail){ txt("detail", s.detail); dw.hidden=false; } else { dw.hidden=true; }
   }catch(e){ document.getElementById("badge").textContent="no status yet"; }
