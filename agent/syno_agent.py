@@ -431,6 +431,18 @@ def _start_status_writer() -> None:
     threading.Thread(target=run, daemon=True).start()
 
 
+def _write_uid_file() -> None:
+    """Record the agent's own UID into the persistent var dir so the one-time
+    root-grant task can read it with a plain ``cat`` — DSM's Task Scheduler shell
+    has no ``pgrep`` and ``ps -eo user`` truncates the package username to 8 chars
+    (so a name-based sudoers grant is unreliable; a ``#uid`` grant is exact)."""
+    try:
+        with open(os.path.join(_data_dir(), "agent.uid"), "w", encoding="utf-8") as f:
+            f.write(str(os.getuid()))
+    except Exception:
+        pass
+
+
 # --------------------------------------------------------------------------- #
 # Agent
 # --------------------------------------------------------------------------- #
@@ -553,6 +565,7 @@ def main() -> int:
     cfg = _load_config()
     _set_status(server=cfg.get("server_url"), device_id=_device_id(),
                 version=syno_inventory.AGENT_VERSION)
+    _write_uid_file()       # let the root-grant task read our UID (no pgrep needed)
     _start_status_writer()  # publish status/log for the DSM app page (no port)
     if not (cfg.get("server_url") and cfg.get("api_key")):
         log.error("missing server_url/api_key — set RMM_SERVER_URL/RMM_API_KEY or "

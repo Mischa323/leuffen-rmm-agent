@@ -48,12 +48,13 @@ pre{margin:0;padding:14px 20px;white-space:pre-wrap;word-break:break-word;font:1
 <pre id="log">Loading…</pre>
 <script>
 var COLOR = {connected:"#16a34a",connecting:"#d97706",reconnecting:"#d97706",error:"#dc2626",starting:"#64748b"};
-// Grant by numeric UID — `ps -eo user` truncates names to 8 chars (so a
-// package user like "LeuffenRMM" becomes "LeuffenR+" and the sudoers entry is
-// invalid). The UID never truncates and sudoers accepts the "#uid" form.
-var CMD = `P=$(pgrep -f syno_agent.py | head -n1)
-U=$(awk '/^Uid:/{print $2}' /proc/$P/status 2>/dev/null)
-if [ -z "$U" ]; then echo "Leuffen RMM agent is not running - start the package first."; exit 1; fi
+// Grant by numeric UID (sudoers "#uid" form — never truncates, unlike
+// "ps -eo user"). The agent writes its UID to agent.uid, so the command only
+// needs `cat` (DSM's Task Scheduler shell has no pgrep). A /proc fallback uses
+// bash + grep only — no pgrep/awk/ps.
+var CMD = `U=$(cat /var/packages/LeuffenRMM/var/agent.uid 2>/dev/null)
+if [ -z "$U" ]; then for d in /proc/[0-9]*; do if grep -qs '[s]yno_agent\\.py' "$d/cmdline"; then while read k v _; do [ "$k" = "Uid:" ] && U=$v && break; done < "$d/status"; break; fi; done; fi
+if [ -z "$U" ]; then echo "Agent not found - start the Leuffen RMM package, then re-run."; exit 1; fi
 echo "#$U ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/leuffen-rmm
 chmod 440 /etc/sudoers.d/leuffen-rmm
 echo "Granted root to agent (uid $U). Restarting..."
