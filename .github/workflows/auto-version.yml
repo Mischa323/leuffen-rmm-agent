@@ -42,7 +42,10 @@ jobs:
           cur="$(grep -oP 'AGENT_VERSION\s*=\s*"\K[^"]+' agent/inventory.py)"
           IFS=. read -r MA MI PA <<< "$cur"
           new="$MA.$MI.$((PA + 1))"
-          sed -i "s/AGENT_VERSION = \"$cur\"/AGENT_VERSION = \"$new\"/" agent/inventory.py
+          # Keep both version constants in lockstep — inventory.py (the canonical
+          # source) and syno_inventory.py (the Synology agent reports its own copy,
+          # since the .spk doesn't bundle inventory.py).
+          sed -i "s/AGENT_VERSION = \"$cur\"/AGENT_VERSION = \"$new\"/" agent/inventory.py agent/syno_inventory.py
           echo "Agent: $cur -> $new"
 
       - name: Commit bump
@@ -53,6 +56,6 @@ jobs:
           fi
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add agent/inventory.py
+          git add agent/inventory.py agent/syno_inventory.py
           git commit -m "chore: auto version bump [version bump]"
           git push origin HEAD:main
