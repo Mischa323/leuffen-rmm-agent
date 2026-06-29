@@ -13,7 +13,7 @@ import uuid
 
 import psutil
 
-AGENT_VERSION = "2.2.25"
+AGENT_VERSION = "2.2.26"
 
 
 def installed_software() -> list[dict]:
