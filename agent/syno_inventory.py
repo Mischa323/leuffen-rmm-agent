@@ -22,7 +22,7 @@ import time
 
 # Keep in sync with inventory.AGENT_VERSION (single source of truth for the SPK
 # version is inventory.py; this constant is the value the running NAS reports).
-AGENT_VERSION = "2.2.30"
+AGENT_VERSION = "2.2.31"
 
 
 # --------------------------------------------------------------------------- #
@@ -422,6 +422,9 @@ def metrics() -> dict:
     backups = active_backup_cached()
     if backups:
         m["backups"] = backups
+    svcs = services_cached()
+    if svcs:
+        m["services"] = svcs
     return m
 
 
@@ -443,6 +446,12 @@ _ABB_TYPE = {1: "Virtual Machine", 2: "Personal Computer", 3: "Physical Server",
 _backup_cache: dict = {"t": 0.0, "data": None, "running": False}
 _backup_lock = threading.Lock()
 _BACKUP_TTL = 600.0
+
+# Services (systemd) — refreshed off the heartbeat and reported once per TTL
+# (the list is largish) for the service monitor.
+_services_cache: dict = {"t": 0.0, "data": None, "running": False, "pending": False}
+_services_lock = threading.Lock()
+_SERVICES_TTL = 300.0
 
 
 def _swa(api: str, method: str, version: int, timeout: float = 20.0, **params) -> dict | None:
@@ -609,3 +618,50 @@ def active_backup_cached() -> dict | None:
             c["running"] = True
             threading.Thread(target=_refresh_backups, daemon=True).start()
         return c["data"]
+
+
+def services() -> list[dict]:
+    """systemd services on DSM (Linux+systemd), for the service monitor: each is
+    {name, display, status, start}; status is 'running' when the unit's sub-state
+    is running, else the sub-state. Best-effort; [] on failure."""
+    try:
+        r = subprocess.run(
+            ["systemctl", "list-units", "--type=service", "--all", "--no-legend",
+             "--plain", "--no-pager"], capture_output=True, text=True, timeout=20)
+    except Exception:
+        return []
+    out: list[dict] = []
+    for line in (r.stdout or "").splitlines():
+        parts = line.split(None, 4)
+        if len(parts) < 4 or not parts[0].endswith(".service"):
+            continue
+        unit, _load, active, sub = parts[0], parts[1], parts[2], parts[3]
+        desc = parts[4] if len(parts) > 4 else ""
+        out.append({"name": unit[: -len(".service")], "display": desc or unit,
+                    "status": "running" if sub == "running" else (sub or active), "start": ""})
+    out.sort(key=lambda x: (x["display"] or x["name"]).lower())
+    return out
+
+
+def _refresh_services() -> None:
+    try:
+        data = services()
+    except Exception:
+        data = None
+    with _services_lock:
+        _services_cache.update(t=time.time(), data=data, running=False, pending=bool(data))
+
+
+def services_cached() -> list | None:
+    """Return the service list once per TTL (right after a background refresh),
+    else None — so the (largish) list isn't repeated on every heartbeat."""
+    now = time.time()
+    with _services_lock:
+        c = _services_cache
+        if c["pending"]:
+            c["pending"] = False
+            return c["data"]
+        if not c["running"] and now - c["t"] > _SERVICES_TTL:
+            c["running"] = True
+            threading.Thread(target=_refresh_services, daemon=True).start()
+        return None

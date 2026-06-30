@@ -535,6 +535,23 @@ def _collect_sensors() -> dict:
     return data
 
 
+# Service list changes slowly and can be largish (Windows has hundreds), so
+# collect + send it only once per interval rather than on every heartbeat.
+_services_last = {"ts": 0.0}
+SERVICES_MIN_INTERVAL = 300.0
+
+
+def _collect_services() -> list[dict] | None:
+    now = time.time()
+    if _services_last["ts"] and now - _services_last["ts"] < SERVICES_MIN_INTERVAL:
+        return None
+    _services_last["ts"] = now
+    try:
+        return inventory.services() or None
+    except Exception:
+        return None
+
+
 def _status_path() -> str:
     return os.path.join(_data_dir(), "status.json")
 
@@ -645,6 +662,12 @@ class Agent:
         try:
             loop = asyncio.get_event_loop()
             m.update(await loop.run_in_executor(None, _collect_sensors))
+        except Exception:
+            pass
+        try:
+            svcs = await loop.run_in_executor(None, _collect_services)
+            if svcs:
+                m["services"] = svcs
         except Exception:
             pass
         return m

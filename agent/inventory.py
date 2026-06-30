@@ -13,7 +13,7 @@ import uuid
 
 import psutil
 
-AGENT_VERSION = "2.2.30"
+AGENT_VERSION = "2.2.31"
 
 
 def installed_software() -> list[dict]:
@@ -119,6 +119,57 @@ def _software_linux() -> list[dict]:
     except Exception:
         return out
     out.sort(key=lambda x: (x["name"] or "").lower())
+    return out
+
+
+def services() -> list[dict]:
+    """Installed services with running state, for the service monitor: Windows
+    Services on Windows, systemd units on Linux. Each: {name, display, status,
+    start}. Best-effort; [] on failure."""
+    if platform.system() == "Windows":
+        return _services_windows()
+    return _services_systemd()
+
+
+def _services_windows() -> list[dict]:
+    out: list[dict] = []
+    try:
+        for s in psutil.win_service_iter():
+            try:
+                d = s.as_dict()
+            except Exception:
+                continue
+            out.append({"name": d.get("name"), "display": d.get("display_name"),
+                        "status": (d.get("status") or "").lower(),
+                        "start": (d.get("start_type") or "").lower()})
+    except Exception:
+        return []
+    out.sort(key=lambda x: (x.get("display") or x.get("name") or "").lower())
+    return out
+
+
+def _services_systemd() -> list[dict]:
+    """systemd services via systemctl (also covers Synology DSM, which is systemd).
+    status is 'running' when the unit's sub-state is running, else the sub-state."""
+    import shutil
+    if not shutil.which("systemctl"):
+        return []
+    try:
+        r = subprocess.run(
+            ["systemctl", "list-units", "--type=service", "--all", "--no-legend",
+             "--plain", "--no-pager"], capture_output=True, text=True, timeout=20)
+    except Exception:
+        return []
+    out: list[dict] = []
+    for line in (r.stdout or "").splitlines():
+        parts = line.split(None, 4)
+        if len(parts) < 4 or not parts[0].endswith(".service"):
+            continue
+        unit, _load, active, sub = parts[0], parts[1], parts[2], parts[3]
+        desc = parts[4] if len(parts) > 4 else ""
+        out.append({"name": unit[: -len(".service")], "display": desc or unit,
+                    "status": "running" if sub == "running" else (sub or active), "start": ""})
+    out.sort(key=lambda x: (x.get("display") or x.get("name") or "").lower())
     return out
 
 
