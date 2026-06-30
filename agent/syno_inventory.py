@@ -22,7 +22,7 @@ import time
 
 # Keep in sync with inventory.AGENT_VERSION (single source of truth for the SPK
 # version is inventory.py; this constant is the value the running NAS reports).
-AGENT_VERSION = "2.2.29"
+AGENT_VERSION = "2.2.30"
 
 
 # --------------------------------------------------------------------------- #
@@ -506,28 +506,54 @@ def _abb_business() -> dict | None:
     return {"tasks": tasks} if tasks else None
 
 
+def _first_list(d) -> list | None:
+    if isinstance(d, dict):
+        for v in d.values():
+            if isinstance(v, list):
+                return v
+    return None
+
+
+def _saas_coverage(base_api: str, task_id) -> dict:
+    """Coverage for one M365/GSuite task: how many accounts/sites/groups are
+    protected. The per-mailbox ``account_status`` is the account *state*
+    (-1 = deleted in the cloud / excluded), not a backup result, so we report
+    protected vs excluded counts. Each sub-API is best-effort — GSuite has no
+    Site/Group, so those simply return nothing and are skipped."""
+    cov: dict = {}
+    ud = _swa(base_api + ".User", "list", 1, timeout=20, task_id=task_id)
+    users = (ud or {}).get("user_list")
+    if isinstance(users, list):
+        excluded = sum(1 for u in users if isinstance(u, dict) and u.get("account_status") == -1)
+        cov["accounts"] = len(users)
+        cov["excluded"] = excluded
+        cov["protected"] = len(users) - excluded
+    for suffix, key in (("Site", "sites"), ("Group", "groups")):
+        lst = _first_list(_swa(f"{base_api}.{suffix}", "list", 1, timeout=20, task_id=task_id))
+        if isinstance(lst, list):
+            cov[key] = len(lst)
+    return cov
+
+
 def _saas_tasks(api: str, pkg_dir: str) -> list[dict] | None:
-    """Microsoft 365 / Google Workspace tasks. Their response groups sub-tasks by
-    service and varies, so walk the structure and pull anything task-shaped."""
+    """Microsoft 365 / Google Workspace tasks with coverage.
+
+    Per-run success/failure isn't exposed by these APIs (only the restore portal,
+    which carries account *state*), so report how many accounts/sites/groups each
+    task protects and leave failure alerting to Synology's own notifications. The
+    list response repeats each task once per role/site/team, so dedupe by id."""
     if not os.path.isdir(pkg_dir):
         return None
     data = _swa(api, "list", 1, timeout=25)
     if not data:
         return None
-    found: list[dict] = []
-    seen: set = set()
+    tasks: dict = {}  # task_id -> task_name
 
     def walk(o):
         if isinstance(o, dict):
-            # A real backup task is the object carrying ``task_name`` — don't pull
-            # in the per-user/site/team sub-objects (they have only ``name``).
             name = o.get("task_name")
-            if name:
-                key = (o.get("task_id"), name)
-                if key not in seen:
-                    seen.add(key)
-                    found.append({"id": o.get("task_id"), "name": name,
-                                  "status": o.get("status")})
+            if name and o.get("task_id") is not None:
+                tasks.setdefault(o.get("task_id"), name)
             for v in o.values():
                 walk(v)
         elif isinstance(o, list):
@@ -535,8 +561,14 @@ def _saas_tasks(api: str, pkg_dir: str) -> list[dict] | None:
                 walk(v)
 
     walk(data)
-    found.sort(key=lambda x: (x["name"] or "").lower())
-    return found or None
+    if not tasks:
+        return None
+    out = []
+    for tid, name in sorted(tasks.items(), key=lambda kv: (kv[1] or "").lower()):
+        entry = {"id": tid, "name": name}
+        entry.update(_saas_coverage(api, tid))
+        out.append(entry)
+    return out or None
 
 
 def active_backup() -> dict | None:
