@@ -817,6 +817,10 @@ class Agent:
     async def _self_update(self, msg: dict, rid: str | None) -> None:
         """Download and apply the latest agent build (blocking work off-loop)."""
         log.info("update requested from server")
+        # Guarantee the persistent config is on disk (%ProgramData%) before the MSI
+        # major-upgrade runs, so the relaunched agent always finds its server URL/key
+        # even if the installer's machine-env-var propagation lags. See _persist_config.
+        _persist_config(self.cfg)
         loop = asyncio.get_event_loop()
         try:
             res = await loop.run_in_executor(None, updater.apply_update, msg, HERE, self.cfg)
@@ -1032,10 +1036,22 @@ def main() -> None:
         log.info("Another Leuffen RMM agent is already running; exiting.")
         sys.exit(0)
     cfg = _load_config()
-    if not cfg.get("server_url") or not cfg.get("api_key"):
-        log.error("Missing server_url/api_key. Set RMM_SERVER_URL and RMM_API_KEY "
-                  "or ship rmm_config.json next to the agent.")
-        sys.exit(1)
+    if not (cfg.get("server_url") and cfg.get("api_key")):
+        # Config can be momentarily absent right after an MSI self-update: the
+        # installer re-sets the server URL/key as machine env vars, but those don't
+        # always reach the relaunched task immediately (and the persistent
+        # %ProgramData% copy may still be landing). Wait for it to appear instead of
+        # crash-looping offline; give up only after the upgrade window elapses.
+        deadline = time.time() + 120
+        while not (cfg.get("server_url") and cfg.get("api_key")):
+            if time.time() >= deadline:
+                log.error("Missing server_url/api_key after waiting. Set RMM_SERVER_URL "
+                          "and RMM_API_KEY or ship rmm_config.json next to the agent.")
+                sys.exit(1)
+            log.warning("server_url/api_key not ready (likely a self-update in "
+                        "progress); retrying in 5s")
+            time.sleep(5)
+            cfg = _load_config()
     _persist_config(cfg)
     _grant_users_writable(_data_dir())
     _allow_inbound_ping()
