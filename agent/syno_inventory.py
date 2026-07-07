@@ -419,6 +419,9 @@ def metrics() -> dict:
     if health:
         # Captured for the dashboard; folded under the volume disks for context.
         m["synology"] = {"disks": health}
+        # Also expose in the shared shape so the disk-health (SMART) monitor
+        # covers Synology alongside Windows/Linux.
+        m["disk_health"] = health
     backups = active_backup_cached()
     if backups:
         m["backups"] = backups
