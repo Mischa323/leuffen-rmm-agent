@@ -28,6 +28,7 @@ import websockets
 
 import handlers
 import inventory
+import monitors
 import netscan
 import snmp
 import updater
@@ -668,6 +669,12 @@ class Agent:
             svcs = await loop.run_in_executor(None, _collect_services)
             if svcs:
                 m["services"] = svcs
+        except Exception:
+            pass
+        # Extended health monitors (disk/SMART, reboot-pending, Windows security,
+        # event log, processes) — throttled internally, best-effort.
+        try:
+            m.update(await loop.run_in_executor(None, monitors.collect))
         except Exception:
             pass
         return m
