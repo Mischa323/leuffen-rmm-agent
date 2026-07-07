@@ -1,53 +1,115 @@
 <!doctype html>
-<html>
+<html lang="en" data-theme="dark">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Cache-Control" content="no-store">
 <meta http-equiv="Pragma" content="no-cache">
 <title>Leuffen RMM agent</title>
 <style>
-body{font-family:system-ui,Segoe UI,Arial,sans-serif;margin:0;background:#0f172a;color:#e2e8f0}
-.hd{padding:16px 20px;background:#1e293b;display:flex;align-items:center;gap:12px}
-.dot{width:12px;height:12px;border-radius:50%;background:#64748b}
-.badge{padding:3px 10px;border-radius:999px;background:#64748b;color:#fff;font-size:12px;font-weight:600;text-transform:capitalize}
-h1{font-size:16px;margin:0;font-weight:650}
-.meta{padding:10px 20px;color:#94a3b8;font-size:13px;display:flex;gap:24px;flex-wrap:wrap;align-items:center}
-.meta b{color:#cbd5e1;font-weight:600}
-.pill{padding:2px 9px;border-radius:999px;font-size:12px;font-weight:600}
-.pill.on{background:#14532d;color:#86efac}
-.pill.off{background:#78350f;color:#fcd34d}
-.banner{margin:0 20px 6px;padding:12px 14px;background:#1e293b;border:1px solid #334155;border-left:3px solid #d97706;border-radius:8px;font-size:13px;line-height:1.6}
-.banner h2{font-size:13.5px;margin:0 0 6px;color:#fcd34d}
-.banner ol{margin:6px 0 8px 18px;padding:0}
-.banner code{display:block;white-space:pre-wrap;word-break:break-all;background:#0b1220;color:#e2e8f0;padding:8px 10px;border-radius:6px;font:12px/1.5 ui-monospace,Consolas,monospace}
-.banner button{margin-top:8px;background:#334155;color:#e2e8f0;border:0;padding:6px 12px;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer}
-.banner button:hover{background:#475569}
-pre{margin:0;padding:14px 20px;white-space:pre-wrap;word-break:break-word;font:12px/1.55 ui-monospace,Consolas,monospace;background:#0b1220;min-height:40vh}
+/* Self-contained — the DSM package ships one standalone file (no build step,
+   no guaranteed Google Fonts). Onest is a progressive enhancement; the system
+   stack is the fallback. Semantic tints use plain rgba (no color-mix needed). */
+@import url('https://fonts.googleapis.com/css2?family=Onest:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+:root{
+  --bg:#0a0c11; --surface:#12161e; --surface-2:#171c26; --surface-3:#1c222e; --surface-hover:#1a212c;
+  --border:#232b37; --border-strong:#303a48;
+  --text:#e9eef6; --text-dim:#97a3b4; --text-faint:#5f6b7c;
+  --accent:#3b82f6; --good:#34d399; --warn:#fbbf24; --bad:#f87171; --gold-text:#fbbf24;
+  --term-bg:#0a0e14; --r-sm:7px; --r-md:10px;
+  --font-sans:"Onest",-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
+  --font-mono:"JetBrains Mono",ui-monospace,Consolas,monospace;
+}
+*{box-sizing:border-box;}
+body{margin:0;font-family:var(--font-sans);font-size:14px;color:var(--text);
+  background:radial-gradient(900px 480px at 85% -12%, rgba(59,130,246,.09), transparent 60%), var(--bg);
+  -webkit-font-smoothing:antialiased;padding:24px;}
+.wrap{max-width:600px;margin:0 auto;background:var(--surface);border:1px solid var(--border);
+  border-radius:12px;overflow:hidden;box-shadow:0 24px 60px -20px rgba(0,0,0,.5);}
+
+/* header */
+.na-head{display:flex;align-items:center;gap:12px;padding:18px 22px;border-bottom:1px solid var(--border);}
+.nas-ico{width:40px;height:40px;border-radius:10px;display:grid;place-items:center;background:var(--surface-2);
+  border:1px solid var(--border);color:var(--gold-text);flex:none;}
+.nas-ico svg{width:22px;height:22px;}
+.na-head h1{margin:0;font-size:16px;font-weight:700;letter-spacing:-0.01em;}
+.badge{margin-left:auto;display:inline-flex;align-items:center;gap:6px;padding:4px 11px;border-radius:999px;
+  font-size:12px;font-weight:600;text-transform:capitalize;background:var(--surface-3);color:var(--text-dim);}
+.badge .dot{width:7px;height:7px;border-radius:50%;background:var(--text-faint);flex:none;}
+.badge.connected{background:rgba(52,211,153,.15);color:var(--good);} .badge.connected .dot{background:var(--good);box-shadow:0 0 7px var(--good);}
+.badge.connecting,.badge.reconnecting{background:rgba(251,191,36,.15);color:var(--warn);} .badge.connecting .dot,.badge.reconnecting .dot{background:var(--warn);}
+.badge.error{background:rgba(248,113,113,.15);color:var(--bad);} .badge.error .dot{background:var(--bad);}
+.badge.starting{background:var(--surface-3);color:var(--text-dim);} .badge.starting .dot{background:var(--text-faint);}
+
+/* meta grid */
+.na-meta{display:grid;grid-template-columns:repeat(2,1fr);gap:1px;background:var(--border);border-bottom:1px solid var(--border);}
+.na-meta .m{background:var(--surface);padding:13px 22px;min-width:0;}
+.na-meta .ml{font-size:10.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--text-faint);font-weight:600;}
+.na-meta .mv{font-size:13.5px;font-weight:550;margin-top:4px;overflow-wrap:anywhere;}
+.na-meta .mv.mono{font-family:var(--font-mono);font-size:12.5px;}
+.pill{display:inline-flex;align-items:center;padding:2px 9px;border-radius:999px;font-size:12px;font-weight:600;text-transform:capitalize;}
+.pill.on{background:rgba(52,211,153,.15);color:var(--good);}
+.pill.off{background:rgba(245,158,11,.16);color:var(--gold-text);}
+
+/* detail line */
+.na-detail{margin:14px 22px 0;font-size:12px;color:var(--text-dim);}
+.na-detail b{color:var(--text-faint);font-weight:600;}
+
+/* grant card (amber) */
+.na-grant{margin:18px 22px;background:rgba(245,158,11,.14);border:1px solid rgba(245,158,11,.32);
+  border-radius:var(--r-md);padding:16px 18px;}
+.na-grant h2{display:flex;align-items:center;gap:8px;margin:0 0 8px;font-size:13.5px;font-weight:650;color:var(--gold-text);}
+.na-grant h2 svg{width:16px;height:16px;flex:none;}
+.na-grant p{margin:0 0 10px;font-size:12.5px;line-height:1.6;color:var(--text-dim);}
+.na-grant ol{margin:0 0 12px;padding-left:18px;font-size:12.5px;line-height:1.7;color:var(--text-dim);}
+.na-grant ol b{color:var(--text);}
+.na-code{position:relative;background:var(--term-bg);border:1px solid var(--border);border-radius:var(--r-sm);
+  padding:12px 13px;font:11.5px/1.6 var(--font-mono);color:#b9c4d4;white-space:pre-wrap;word-break:break-all;
+  max-height:190px;overflow:auto;}
+.na-copy{position:absolute;top:9px;right:9px;background:var(--surface-2);color:var(--text);border:1px solid var(--border);
+  border-radius:6px;padding:5px 11px;font:600 12px var(--font-sans);cursor:pointer;}
+.na-copy:hover{background:var(--surface-hover);border-color:var(--border-strong);}
+
+/* log */
+.na-sec{font-size:11px;text-transform:uppercase;letter-spacing:.07em;color:var(--text-faint);font-weight:600;margin:20px 22px 8px;}
+.na-log{margin:0 22px 20px;background:var(--term-bg);border:1px solid var(--border);border-radius:var(--r-md);
+  padding:14px 16px;font:11.5px/1.6 var(--font-mono);color:#8b98a9;white-space:pre-wrap;word-break:break-word;
+  max-height:44vh;overflow:auto;}
+.na-log .ok{color:var(--good);} .na-log .warn{color:var(--gold-text);} .na-log .err{color:var(--bad);} .na-log .dim{color:var(--text-faint);}
 </style>
 </head>
 <body>
-<div class="hd"><span class="dot" id="dot"></span><h1>Leuffen RMM agent</h1><span class="badge" id="badge">…</span></div>
-<div class="meta">
-  <span><b>Server:</b> <span id="server">—</span></span>
-  <span><b>Device:</b> <span id="device">—</span></span>
-  <span><b>Version:</b> <span id="version">—</span></span>
-  <span><b>Active Backup &amp; root:</b> <span class="pill off" id="rights">checking…</span></span>
-  <span id="detailwrap" hidden><b>Detail:</b> <span id="detail"></span></span>
+<div class="wrap">
+  <div class="na-head">
+    <span class="nas-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="3" width="12" height="18" rx="2"/><path d="M9 7h6M9 11h6"/><path d="M15 16.5h.01"/></svg></span>
+    <h1>Leuffen RMM agent</h1>
+    <span class="badge starting" id="badge"><span class="dot" id="dot"></span><span id="badge-text">…</span></span>
+  </div>
+
+  <div class="na-meta">
+    <div class="m"><div class="ml">Server</div><div class="mv mono" id="server">—</div></div>
+    <div class="m"><div class="ml">Device ID</div><div class="mv mono" id="device">—</div></div>
+    <div class="m"><div class="ml">Agent version</div><div class="mv" id="version">—</div></div>
+    <div class="m"><div class="ml">Active Backup &amp; root</div><div class="mv"><span class="pill off" id="rights">checking…</span></div></div>
+  </div>
+
+  <div class="na-detail" id="detailwrap" hidden><b>Detail:</b> <span id="detail"></span></div>
+
+  <div class="na-grant" id="enable" hidden>
+    <h2><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 3.3 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.3a2 2 0 0 0-3.4 0Z"/><path d="M12 9v4m0 4h.01"/></svg> Active Backup &amp; remote reboot are not enabled</h2>
+    <p>DSM 7 reserves root for Synology-signed packages, so the agent runs unprivileged (core metrics only). Grant it once to enable <b>Active Backup monitoring</b>, <b>remote reboot / shutdown</b> and a <b>root shell</b>:</p>
+    <ol>
+      <li><b>Control Panel &rarr; Task Scheduler &rarr; Create &rarr; Scheduled Task &rarr; User-defined script</b></li>
+      <li>Set <b>User: root</b>; give it any name</li>
+      <li>Paste the command below into <b>Run command</b>, save, then select the task and click <b>Run</b> (delete it afterwards)</li>
+    </ol>
+    <div class="na-code"><button class="na-copy" id="copy" type="button">Copy</button><span id="cmd"></span></div>
+  </div>
+
+  <div class="na-sec">Agent log</div>
+  <pre class="na-log" id="log">Loading&hellip;</pre>
 </div>
-<div class="banner" id="enable" hidden>
-  <h2>Active Backup &amp; remote reboot are not enabled</h2>
-  <div>DSM 7 reserves root for Synology-signed packages, so the agent runs unprivileged (core metrics only). Grant it once to enable <b>Active Backup monitoring</b>, <b>remote reboot/shutdown</b> and <b>root shell</b>:</div>
-  <ol>
-    <li><b>Control Panel → Task Scheduler → Create → Scheduled Task → User-defined script</b></li>
-    <li>Set <b>User: root</b>; give it any name</li>
-    <li>Paste the command below into <b>Run command</b>, save, then select the task and click <b>Run</b> (delete it afterwards)</li>
-  </ol>
-  <code id="cmd"></code>
-  <button id="copy" type="button">Copy command</button>
-</div>
-<pre id="log">Loading…</pre>
 <script>
-var COLOR = {connected:"#16a34a",connecting:"#d97706",reconnecting:"#d97706",error:"#dc2626",starting:"#64748b"};
 // Grant by numeric UID (sudoers "#uid" form — never truncates, unlike
 // "ps -eo user"). The agent writes its UID to agent.uid, so the command only
 // needs `cat` (DSM's Task Scheduler shell has no pgrep). A /proc fallback uses
@@ -64,17 +126,31 @@ function txt(id,v){document.getElementById(id).textContent=v;}
 document.getElementById("cmd").textContent = CMD;
 document.getElementById("copy").onclick = function(){
   navigator.clipboard && navigator.clipboard.writeText(CMD);
-  this.textContent = "Copied"; var b=this; setTimeout(function(){b.textContent="Copy command";},1500);
+  this.textContent = "Copied"; var b=this; setTimeout(function(){b.textContent="Copy";},1500);
 };
+
+// Colour-code the agent log: red for errors, amber for warnings/unprivileged,
+// green for connected/heartbeat, faint for timestamps. HTML-escaped first.
+function esc(s){return s.replace(/[&<>]/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;"}[c];});}
+function colourize(raw){
+  return (raw||"").split("\n").map(function(line){
+    var cls = "";
+    if(/error|failed|traceback|refused|cannot|denied/i.test(line)) cls="err";
+    else if(/unprivileged|unavailable|not enabled|warn|reconnect|retry|expired/i.test(line)) cls="warn";
+    else if(/connected|registered|granted|heartbeat|\bok\b/i.test(line)) cls="ok";
+    var h = esc(line).replace(/^(\[[^\]]+\]|\d{4}-\d\d-\d\d[ T][\d:]+)/, '<span class="dim">$1</span>');
+    return cls ? '<span class="'+cls+'">'+h+'</span>' : h;
+  }).join("\n");
+}
+
 async function refresh(){
   try{
     var s = await (await fetch("status.json?t="+Date.now(),{cache:"no-store"})).json();
     var state = s.state || "starting";
-    var c = COLOR[state] || "#64748b";
-    document.getElementById("dot").style.background = c;
-    var b = document.getElementById("badge"); b.textContent = state; b.style.background = c;
+    document.getElementById("badge").className = "badge " + state;
+    txt("badge-text", state);
     txt("server", s.server || "(not configured)");
-    txt("device", (s.device_id||"").slice(0,16));
+    txt("device", (s.device_id||"").slice(0,16) || "—");
     txt("version", s.version || "—");
     var priv = !!s.privileged;
     var r = document.getElementById("rights");
@@ -83,10 +159,10 @@ async function refresh(){
     document.getElementById("enable").hidden = priv;
     var dw = document.getElementById("detailwrap");
     if(s.detail){ txt("detail", s.detail); dw.hidden=false; } else { dw.hidden=true; }
-  }catch(e){ document.getElementById("badge").textContent="no status yet"; }
+  }catch(e){ txt("badge-text","no status yet"); }
   try{
     var log = await (await fetch("agent-log.txt?t="+Date.now(),{cache:"no-store"})).text();
-    document.getElementById("log").textContent = log || "(no log yet)";
+    document.getElementById("log").innerHTML = colourize(log) || "(no log yet)";
   }catch(e){ document.getElementById("log").textContent = "(agent has not written a log yet)"; }
 }
 refresh(); setInterval(refresh, 4000);
