@@ -35,16 +35,21 @@ ACCENT  = (59, 130, 246, 255)   # brand blue
 GOOD    = (34, 197, 94, 255)
 BAD     = (239, 68, 68, 255)
 
-# ---------- dark-theme palette (matches web CSS variables) ----------
-BG      = "#0d1117"
-SURFACE = "#161b22"
-SURF2   = "#1c2128"
-BORDER  = "#30363d"
-TEXT    = "#e6edf3"
-TEXTDIM = "#8b949e"
+# ---------- dark-theme palette (matches the web UI design tokens) ----------
+BG        = "#0a0c11"
+SURFACE   = "#12161e"
+SURF2     = "#171c26"
+SURF3     = "#1c222e"
+BORDER    = "#232b37"
+BORDERSTR = "#2f3947"
+TEXT      = "#e6ebf3"
+TEXTDIM   = "#97a3b4"
+TEXTFAINT = "#5f6b7c"
 ACCENT_HEX = "#3b82f6"
+GOOD_HEX   = "#22c55e"
 BAD_HEX    = "#ef4444"
 FONT    = "Segoe UI"            # Onest isn't bundled on Windows; Segoe is next best
+MONO    = "Consolas"           # technical fields: URL, key, fingerprint
 
 
 def _data_dir() -> str:
@@ -113,6 +118,21 @@ def _rel(ts) -> str:
 # --------------------------------------------------------------------------- #
 # Settings dialog — dark themed, styled like the web UI
 # --------------------------------------------------------------------------- #
+def _round_rect(cv, x0, y0, x1, y1, r, **kw):
+    """Draw a rounded rectangle on a Tk canvas (smoothed polygon)."""
+    pts = [x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1,
+           x1 - r, y1, x0 + r, y1, x0, y1, x0, y1 - r, x0, y0 + r, x0, y0]
+    return cv.create_polygon(pts, smooth=True, **kw)
+
+
+def _pill(cv, x0, y0, x1, y1, fill):
+    """Draw a capsule/pill (two circles + a bridging rectangle)."""
+    r = (y1 - y0) / 2
+    cv.create_oval(x0, y0, x0 + 2 * r, y1, fill=fill, outline="")
+    cv.create_oval(x1 - 2 * r, y0, x1, y1, fill=fill, outline="")
+    cv.create_rectangle(x0 + r, y0, x1 - r, y1, fill=fill, outline="")
+
+
 def _restart_agent() -> None:
     for args in (["schtasks", "/end", "/tn", "LeuffenRMMAgent"],
                  ["taskkill", "/F", "/IM", "leuffen-rmm-agent.exe"],
@@ -123,10 +143,11 @@ def _restart_agent() -> None:
             pass
 
 
-def _apply_settings(url: str, key: str, insecure: bool) -> None:
+def _apply_settings(url: str, key: str, insecure: bool, fingerprint: str = "") -> None:
     """Persist config to machine env (needs admin) and restart the agent."""
     for name, val in (("RMM_SERVER_URL", url), ("RMM_API_KEY", key),
-                      ("RMM_INSECURE_TLS", "1" if insecure else "0")):
+                      ("RMM_INSECURE_TLS", "1" if insecure else "0"),
+                      ("RMM_SERVER_FINGERPRINT", (fingerprint or "").strip())):
         subprocess.run(["setx", "/M", name, val], capture_output=True, timeout=20)
     _restart_agent()
 
@@ -184,9 +205,10 @@ def settings_dialog() -> None:
     cur_url      = os.environ.get("RMM_SERVER_URL") or saved.get("server_url") or status.get("server_url") or ""
     cur_key      = os.environ.get("RMM_API_KEY")    or saved.get("api_key")    or ""
     cur_insecure = saved.get("insecure_tls", os.environ.get("RMM_INSECURE_TLS", "1") == "1")
+    cur_fp       = os.environ.get("RMM_SERVER_FINGERPRINT") or saved.get("server_fingerprint") or ""
 
     root = tk.Tk()
-    root.title("Leuffen RMM")
+    root.title("Leuffen RMM — Agent settings")
     root.resizable(False, False)
     root.configure(bg=BG)
     try:
@@ -194,126 +216,138 @@ def settings_dialog() -> None:
     except Exception:
         pass
 
-    # ---- ttk style ----
+    # ttk is used only for the two footer buttons; everything else is plain tk so
+    # we get exact control over the dark palette, borders and the pill toggle.
     style = ttk.Style(root)
     style.theme_use("clam")
-    style.configure(".", background=BG, foreground=TEXT, font=(FONT, 9),
-                    bordercolor=BORDER, troughcolor=SURF2, insertcolor=TEXT)
-    style.configure("TFrame",  background=BG)
-    style.configure("Card.TFrame", background=SURFACE, relief="flat")
-    style.configure("TLabel",  background=BG, foreground=TEXT, font=(FONT, 9))
-    style.configure("Dim.TLabel", background=BG, foreground=TEXTDIM, font=(FONT, 8))
-    style.configure("Head.TLabel", background=BG, foreground=TEXT, font=(FONT, 13, "bold"))
-    style.configure("Sub.TLabel",  background=BG, foreground=TEXTDIM, font=(FONT, 9))
-    style.configure("TEntry", fieldbackground=SURF2, foreground=TEXT, bordercolor=BORDER,
-                    insertcolor=TEXT, font=(FONT, 9), padding=6)
-    style.configure("TCheckbutton", background=BG, foreground=TEXTDIM, font=(FONT, 9))
-    style.map("TCheckbutton", background=[("active", BG)])
-    # Primary button
     style.configure("Accent.TButton", background=ACCENT_HEX, foreground="#ffffff",
-                    bordercolor=ACCENT_HEX, font=(FONT, 9, "bold"), padding=(14, 7), relief="flat")
+                    bordercolor=ACCENT_HEX, font=(FONT, 9, "bold"), padding=(15, 7), relief="flat")
     style.map("Accent.TButton",
-              background=[("active", "#2563eb"), ("pressed", "#1d4ed8")],
-              bordercolor=[("active", "#2563eb")])
-    # Ghost button
-    style.configure("Ghost.TButton", background=BG, foreground=TEXTDIM,
-                    bordercolor=BORDER, font=(FONT, 9), padding=(12, 6), relief="flat")
-    style.map("Ghost.TButton",
-              background=[("active", SURF2)],
-              foreground=[("active", TEXT)])
-    # Status badge
-    style.configure("OK.TLabel",  background=BG, foreground="#22c55e", font=(FONT, 9, "bold"))
-    style.configure("Bad.TLabel", background=BG, foreground=BAD_HEX,  font=(FONT, 9, "bold"))
+              background=[("active", "#2f74e6"), ("pressed", "#1d4ed8"), ("disabled", SURF3)],
+              foreground=[("disabled", TEXTDIM)], bordercolor=[("active", "#2f74e6")])
+    style.configure("Ghost.TButton", background=SURF2, foreground=TEXT,
+                    bordercolor=BORDER, font=(FONT, 9), padding=(13, 6), relief="flat")
+    style.map("Ghost.TButton", background=[("active", SURF3)], bordercolor=[("active", BORDERSTR)])
 
-    # ---- outer padding ----
-    outer = ttk.Frame(root, padding=24)
-    outer.grid(row=0, column=0, sticky="nsew")
+    outer = tk.Frame(root, bg=BG, padx=24, pady=22)
+    outer.pack(fill="both", expand=True)
 
-    # ---- header ----
-    hdr = ttk.Frame(outer)
-    hdr.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 20))
+    # ---- header: rounded accent tile + shield glyph, title + subtitle ----
+    hdr = tk.Frame(outer, bg=BG)
+    hdr.pack(fill="x", pady=(0, 18))
+    sh = tk.Canvas(hdr, width=40, height=40, bg=BG, highlightthickness=0)
+    sh.pack(side="left", padx=(0, 12))
+    _round_rect(sh, 0, 0, 40, 40, 10, fill=ACCENT_HEX, outline="")
+    sh.create_polygon([11, 11, 29, 11, 29, 22, 20, 31, 11, 22], fill="white", outline="")
+    sh.create_line(16, 20, 19, 23, 25, 15, fill=ACCENT_HEX, width=2)
+    htxt = tk.Frame(hdr, bg=BG)
+    htxt.pack(side="left", anchor="w")
+    tk.Label(htxt, text="Agent settings", bg=BG, fg=TEXT, font=(FONT, 14, "bold")).pack(anchor="w")
+    tk.Label(htxt, text="Connect this PC to your Leuffen RMM server", bg=BG, fg=TEXTDIM,
+             font=(FONT, 9)).pack(anchor="w")
 
-    # Shield icon (small canvas)
-    shield_cv = tk.Canvas(hdr, width=36, height=36, bg=BG, highlightthickness=0)
-    shield_cv.grid(row=0, column=0, rowspan=2, padx=(0, 10))
-    shield_cv.create_polygon([7,7, 29,7, 29,20, 18,32, 7,20],
-                              fill=ACCENT_HEX, outline="")
-    shield_cv.create_line(12,18, 17,23, 25,13, fill="white", width=2)
-
-    ttk.Label(hdr, text="Leuffen RMM", style="Head.TLabel").grid(row=0, column=1, sticky="w")
-    ttk.Label(hdr, text="Agent settings", style="Sub.TLabel").grid(row=1, column=1, sticky="w")
-
-    # ---- connection status banner ----
+    # ---- connection banner (surface-2 card) ----
     conn = bool(status.get("connected")) and (time.time() - status.get("updated", 0) < 120)
-    banner = ttk.Frame(outer, padding=(14, 10), style="Card.TFrame")
-    banner.configure(style="Card.TFrame")
-    banner.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 18))
-    banner.configure()
-    _dot_col = "#22c55e" if conn else BAD_HEX
-    dot_cv = tk.Canvas(banner, width=10, height=10, bg=SURFACE, highlightthickness=0)
-    dot_cv.grid(row=0, column=0, padx=(0, 8))
-    dot_cv.create_oval(1, 1, 9, 9, fill=_dot_col, outline="")
-    sty = "OK.TLabel" if conn else "Bad.TLabel"
-    ttk.Label(banner, text="Connected" if conn else "Disconnected",
-              style=sty, background=SURFACE).grid(row=0, column=1, sticky="w")
+    banner = tk.Frame(outer, bg=SURF2, highlightthickness=1, highlightbackground=BORDER)
+    banner.pack(fill="x", pady=(0, 18))
+    bin_ = tk.Frame(banner, bg=SURF2)
+    bin_.pack(fill="x", padx=14, pady=11)
+    dot_cv = tk.Canvas(bin_, width=10, height=10, bg=SURF2, highlightthickness=0)
+    dot_cv.pack(side="left", padx=(0, 8))
+    dot_cv.create_oval(0, 0, 9, 9, fill=(GOOD_HEX if conn else BAD_HEX), outline="")
+    tk.Label(bin_, text="Connected" if conn else "Disconnected", bg=SURF2,
+             fg=(GOOD_HEX if conn else BAD_HEX), font=(FONT, 10, "bold")).pack(side="left")
+    _meta = []
     if status.get("last_sync"):
-        ttk.Label(banner, text=f"Last sync: {_rel(status.get('last_sync'))}",
-                  style="Dim.TLabel", background=SURFACE).grid(row=0, column=2, sticky="e", padx=(20, 0))
+        _meta.append(f"Last sync: {_rel(status.get('last_sync'))}")
+    _ver = status.get("version") or saved.get("version")
+    if _ver:
+        _meta.append(f"agent v{_ver}")
+    if _meta:
+        tk.Label(bin_, text="  ·  ".join(_meta), bg=SURF2, fg=TEXTFAINT,
+                 font=(FONT, 8)).pack(side="right")
 
-    # ---- form fields ----
-    def _label(row, text, hint=None):
-        ttk.Label(outer, text=text).grid(row=row, column=0, sticky="nw",
-                                          padx=(0, 16), pady=(0, 2))
+    # ---- field helpers (plain tk for exact dark styling + focus border) ----
+    def _field(label, hint, show=None, initial="", trailing=None):
+        fr = tk.Frame(outer, bg=BG)
+        fr.pack(fill="x", pady=(0, 13))
+        tk.Label(fr, text=label.upper(), bg=BG, fg=TEXTFAINT,
+                 font=(FONT, 8, "bold")).pack(anchor="w", pady=(0, 5))
+        row = tk.Frame(fr, bg=BG)
+        row.pack(fill="x")
+        e = tk.Entry(row, show=show or "", bg=SURF2, fg=TEXT, insertbackground=TEXT, relief="flat",
+                     highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT_HEX,
+                     font=(MONO, 10))
+        if initial:
+            e.insert(0, initial)
+        e.pack(side="left", fill="x", expand=True, ipady=6, ipadx=8)
+        if trailing is not None:
+            trailing(row, e)
         if hint:
-            ttk.Label(outer, text=hint, style="Dim.TLabel").grid(
-                row=row + 1, column=1, sticky="w", pady=(0, 10))
-
-    def _entry(row, show=None):
-        e = ttk.Entry(outer, width=42, show=show or "")
-        e.grid(row=row, column=1, sticky="ew", pady=(0, 2))
+            tk.Label(fr, text=hint, bg=BG, fg=TEXTDIM, font=(FONT, 8),
+                     wraplength=440, justify="left").pack(anchor="w", pady=(5, 0))
         return e
 
-    _label(2, "Server URL", "e.g. https://rmm.example.com:8000")
-    url_e = _entry(2)
-    url_e.insert(0, cur_url)
+    url_e = _field("Server URL", "The address of your Leuffen RMM server, e.g. https://rmm.example.com:8000",
+                   initial=cur_url)
 
-    _label(4, "Enrollment key", "Settings → your org → Downloads → Enrollment key")
-    key_e = _entry(4, show="•")
-    key_e.insert(0, cur_key)
+    def _key_trailing(row, entry):
+        def _toggle():
+            entry.configure(show="" if entry.cget("show") else "•")
+            eye_btn.configure(text="Hide" if not entry.cget("show") else "Show")
+        eye_btn = ttk.Button(row, text="Show", style="Ghost.TButton", width=6, command=_toggle)
+        eye_btn.pack(side="left", padx=(6, 0))
+    key_e = _field("Enrollment key", "Dashboard → your org → Downloads → Enrollment key",
+                   show="•", initial=cur_key, trailing=_key_trailing)
 
-    # Show/hide toggle for key
-    def _toggle_key():
-        key_e.configure(show="" if key_e.cget("show") else "•")
-        eye_btn.configure(text="Hide" if not key_e.cget("show") else "Show")
-    eye_btn = ttk.Button(outer, text="Show", style="Ghost.TButton", command=_toggle_key, width=6)
-    eye_btn.grid(row=4, column=2, padx=(6, 0))
+    fp_e = _field("Server fingerprint  ·  optional",
+                  "SHA-256 of the server's TLS certificate — MITM-proof even on a self-signed setup. "
+                  "Leave blank to skip.", initial=cur_fp)
 
+    # ---- divider ----
+    tk.Frame(outer, height=1, bg=BORDER).pack(fill="x", pady=(3, 15))
+
+    # ---- pill toggle: accept self-signed certificate ----
     insecure = tk.BooleanVar(value=bool(cur_insecure))
-    cb = ttk.Checkbutton(outer, text="Accept self-signed certificate",
-                          variable=insecure)
-    cb.grid(row=6, column=1, sticky="w", pady=(4, 18))
-    ttk.Label(outer, text="Leave on for the default server setup",
-              style="Dim.TLabel").grid(row=7, column=1, sticky="w", pady=(0, 18))
+    trow = tk.Frame(outer, bg=BG)
+    trow.pack(fill="x", pady=(0, 3))
+    ttxt = tk.Frame(trow, bg=BG)
+    ttxt.pack(side="left", fill="x", expand=True)
+    tk.Label(ttxt, text="Accept self-signed certificate", bg=BG, fg=TEXT,
+             font=(FONT, 10, "bold")).pack(anchor="w")
+    tk.Label(ttxt, text="Leave on for the default bundled server setup.", bg=BG, fg=TEXTDIM,
+             font=(FONT, 8)).pack(anchor="w")
+    pill = tk.Canvas(trow, width=44, height=25, bg=BG, highlightthickness=0, cursor="hand2")
+    pill.pack(side="right")
 
-    # ---- separator ----
-    sep = tk.Frame(outer, height=1, bg=BORDER)
-    sep.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(0, 16))
+    def _draw_pill():
+        pill.delete("all")
+        if insecure.get():
+            _pill(pill, 0, 0, 44, 25, ACCENT_HEX)
+            _pill(pill, 21, 3, 40, 22, "#ffffff")
+        else:
+            _pill(pill, 0, 0, 44, 25, BORDERSTR)
+            _pill(pill, 1, 1, 43, 24, SURF3)
+            _pill(pill, 3, 3, 22, 22, TEXTFAINT)
+    pill.bind("<Button-1>", lambda e: (insecure.set(not insecure.get()), _draw_pill()))
+    _draw_pill()
 
-    # ---- error label ----
-    err_var = tk.StringVar()
-    err_lbl = ttk.Label(outer, textvariable=err_var, foreground=BAD_HEX,
-                         background=BG, font=(FONT, 9), wraplength=380)
-    err_lbl.grid(row=9, column=0, columnspan=3, sticky="w", pady=(0, 8))
+    # ---- divider ----
+    tk.Frame(outer, height=1, bg=BORDER).pack(fill="x", pady=(15, 14))
 
-    # ---- buttons ----
-    btns = ttk.Frame(outer)
-    btns.grid(row=10, column=0, columnspan=3, sticky="e")
+    # ---- footer: inline status (left) + Cancel / Save (right) ----
+    foot = tk.Frame(outer, bg=BG)
+    foot.pack(fill="x")
+    status_var = tk.StringVar()
+    status_lbl = tk.Label(foot, textvariable=status_var, bg=BG, fg=BAD_HEX,
+                          font=(FONT, 9), wraplength=300, justify="left")
+    status_lbl.pack(side="left", fill="x", expand=True)
 
-    save_btn: list = []  # mutable container so inner functions can rebind
+    save_btn: list = []
 
-    def _do_save(u, k):
+    def _do_save(u, k, fp):
         if _is_admin():
-            _apply_settings(u, k, bool(insecure.get()))
+            _apply_settings(u, k, bool(insecure.get()), fp)
             _msgbox(root, "Settings saved. The agent is reconnecting.")
             root.destroy()
             return
@@ -321,24 +355,26 @@ def settings_dialog() -> None:
         fd, path = tempfile.mkstemp(suffix=".json")
         os.close(fd)
         with open(path, "w") as f:
-            json.dump({"url": u, "key": k, "insecure": bool(insecure.get())}, f)
+            json.dump({"url": u, "key": k, "insecure": bool(insecure.get()), "fingerprint": fp}, f)
         _elevate(f'--apply "{path}"')
         _msgbox(root, "Approve the administrator prompt to finish saving.")
         root.destroy()
 
     def save():
         u, k = url_e.get().strip(), key_e.get().strip()
+        fp = fp_e.get().strip()
+        status_lbl.configure(fg=BAD_HEX)
         if not u:
-            err_var.set("Server URL is required.")
+            status_var.set("Server URL is required.")
             return
         if not k:
-            err_var.set("Enrollment key is required.")
+            status_var.set("Enrollment key is required.")
             return
         if not u.startswith(("http://", "https://")):
             u = "https://" + u
             url_e.delete(0, "end")
             url_e.insert(0, u)
-        err_var.set("")
+        status_var.set("")
         if save_btn:
             save_btn[0].configure(text="Testing connection…", state="disabled")
 
@@ -348,20 +384,24 @@ def settings_dialog() -> None:
                 if save_btn:
                     save_btn[0].configure(text="Save settings", state="normal")
                 if err:
-                    err_var.set(err)
+                    status_lbl.configure(fg=BAD_HEX)
+                    status_var.set(err)
                 else:
-                    _do_save(u, k)
+                    status_lbl.configure(fg=GOOD_HEX)
+                    status_var.set("✓ Connection verified")
+                    _do_save(u, k, fp)
             root.after(0, _update)
 
         threading.Thread(target=_run, daemon=True).start()
 
-    ttk.Button(btns, text="Cancel", style="Ghost.TButton",
-               command=root.destroy).pack(side="right", padx=(6, 0))
-    btn = ttk.Button(btns, text="Save settings", style="Accent.TButton", command=save)
+    btn = ttk.Button(foot, text="Save settings", style="Accent.TButton", command=save)
     btn.pack(side="right")
+    ttk.Button(foot, text="Cancel", style="Ghost.TButton",
+               command=root.destroy).pack(side="right", padx=(0, 8))
     save_btn.append(btn)
 
-    outer.columnconfigure(1, weight=1)
+    root.update_idletasks()
+    root.minsize(root.winfo_reqwidth(), root.winfo_reqheight())
     root.mainloop()
 
 
@@ -460,7 +500,7 @@ def _do_apply(path: str) -> None:
     try:
         with open(path) as f:
             d = json.load(f)
-        _apply_settings(d["url"], d["key"], bool(d.get("insecure", True)))
+        _apply_settings(d["url"], d["key"], bool(d.get("insecure", True)), d.get("fingerprint", ""))
     except Exception:
         return
     finally:
