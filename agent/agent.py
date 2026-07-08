@@ -876,11 +876,17 @@ class Agent:
         async def on_error(err: str) -> None:
             await self._send({"type": "screen_error", "error": err})
 
+        async def on_info(info: dict) -> None:
+            # Codec negotiation info for the viewer (e.g. {codec:"h264", ...}).
+            await self._send({"type": "video_info", **info})
+
         self.screen = ScreenSession(send_bytes, fps=msg.get("fps", 4),
                                     quality=msg.get("quality", 50),
                                     max_edge=msg.get("max_edge", 1600),
                                     on_error=on_error,
-                                    purpose=msg.get("purpose", "control"))
+                                    purpose=msg.get("purpose", "control"),
+                                    codecs=msg.get("codecs"),
+                                    on_info=on_info)
         err = await self.screen.start()
         if err:
             # Surface on the screen channel so the remote viewer shows the reason

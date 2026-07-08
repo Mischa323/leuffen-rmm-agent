@@ -7,3 +7,7 @@ websockets==14.1
 mss==10.0.0
 Pillow==11.1.0
 pynput==1.7.7
+# H.264 remote-desktop encoding (WebCodecs, Phase 1). Optional — screen_h264
+# lazy-imports it and the streamer falls back to JPEG when it's absent. Bundles
+# ffmpeg, so it adds ~30-50 MB to the MSI.
+av==13.1.0

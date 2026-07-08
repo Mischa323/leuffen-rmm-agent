@@ -47,6 +47,8 @@ import subprocess
 import sys
 import threading
 
+import screen_h264
+
 # Default cap on the longest edge of a captured frame before JPEG encoding; the
 # viewer overrides it per speed preset (smaller = higher fps, larger = crisper).
 # Input coordinates are scaled back up so control stays pixel-accurate.
@@ -364,9 +366,11 @@ def _inject(ev: dict, state: dict) -> None:
 
 class ScreenSession:
     def __init__(self, send_bytes, fps: int = 4, quality: int = 50,
-                 max_edge: int = 1600, on_error=None, purpose: str = "control"):
+                 max_edge: int = 1600, on_error=None, purpose: str = "control",
+                 codecs=None, on_info=None):
         self.send_bytes = send_bytes
         self.on_error = on_error
+        self.on_info = on_info
         # 'control' = interactive remote session (shows the consent banner);
         # 'screenshot' = one-shot still grabbed by the dashboard (no banner).
         self.purpose = purpose or "control"
@@ -376,6 +380,10 @@ class ScreenSession:
             self.max_edge = max(320, min(int(max_edge or _MAX_EDGE), 4096))
         except Exception:
             self.max_edge = _MAX_EDGE
+        # Wire codec: H.264 when the viewer supports it (WebCodecs) AND this build
+        # can encode it (PyAV present); otherwise full-frame JPEG (the fallback).
+        want_h264 = bool(codecs) and "h264" in codecs
+        self.codec = "h264" if (want_h264 and screen_h264.available()) else "jpeg"
         self._task: asyncio.Task | None = None
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -390,6 +398,13 @@ class ScreenSession:
         except Exception as exc:
             return f"screen deps unavailable: {exc}"
         self._loop = asyncio.get_event_loop()
+        # Tell the viewer the codec before any frame arrives so it can configure
+        # its decoder. No video_info => the viewer stays in JPEG mode.
+        if self.codec == "h264" and self.on_info:
+            try:
+                await self.on_info({"codec": "h264", "codecString": screen_h264.CODEC_STRING})
+            except Exception:
+                pass
         if platform.system() == "Windows":
             # Capture must run in the interactive session; the SYSTEM agent in
             # session 0 cannot grab the user's desktop. Bridge to a helper there.
@@ -481,7 +496,7 @@ class ScreenSession:
         # session); a normal 'control' session shows the banner in the user's
         # session ('user' mode).
         mode = "screenshot" if self.purpose == "screenshot" else "user"
-        tail = f"{mode} {self.max_edge}"
+        tail = f"{mode} {self.max_edge} {self.codec}"
         # Launch as SYSTEM in the console session FIRST. Only a SYSTEM process can
         # attach to the secure Winlogon desktop (lock screen / sign-in), so this is
         # the path that makes the login screen work -- and it also captures the
@@ -526,6 +541,7 @@ class ScreenSession:
         import time
         from PIL import Image
         interval = 1.0 / self.fps
+        enc = None
         try:
             with mss.mss() as sct:
                 monitor = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
@@ -533,9 +549,15 @@ class ScreenSession:
                     t0 = time.monotonic()
                     shot = sct.grab(monitor)
                     img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
-                    buf = io.BytesIO()
-                    img.save(buf, format="JPEG", quality=self.quality)
-                    await self.send_bytes(buf.getvalue())
+                    if self.codec == "h264":
+                        if enc is None:
+                            enc = screen_h264.H264Encoder(img.width, img.height, self.fps, self.quality)
+                        for au in enc.encode(img):
+                            await self.send_bytes(au)
+                    else:
+                        buf = io.BytesIO()
+                        img.save(buf, format="JPEG", quality=self.quality)
+                        await self.send_bytes(buf.getvalue())
                     await asyncio.sleep(max(0.0, interval - (time.monotonic() - t0)))
         except asyncio.CancelledError:
             pass
@@ -580,17 +602,20 @@ class ScreenSession:
 # --------------------------------------------------------------------------- #
 def _capture_loop(s, fps: int, quality: int, stop: threading.Event,
                   geom: dict | None = None, send_lock: threading.Lock | None = None,
-                  max_edge: int = _MAX_EDGE) -> None:
-    """Grab the screen and stream JPEG frames until ``stop`` is set or the socket
-    drops. On Windows it follows the active input desktop so it keeps working
-    across the secure-desktop switch, downscales big frames, and survives the odd
-    BitBlt failure (e.g. mid secure-desktop switch) instead of ending."""
+                  max_edge: int = _MAX_EDGE, codec: str = "jpeg") -> None:
+    """Grab the screen and stream frames until ``stop`` is set or the socket
+    drops. ``codec`` is 'jpeg' (full frames) or 'h264' (Annex-B, delta-encoded).
+    On Windows it follows the active input desktop so it keeps working across the
+    secure-desktop switch, downscales big frames, and survives the odd BitBlt
+    failure (e.g. mid secure-desktop switch) instead of ending."""
     is_win = platform.system() == "Windows"
     cap_state: dict = {}
     sct = None
     frames = 0
     fails = 0
     reason = "stopped"
+    enc = None          # lazily-created H.264 encoder (recreated on size change)
+    enc_size = None
 
     def _send(data: bytes) -> bool:
         if send_lock is not None:
@@ -633,9 +658,16 @@ def _capture_loop(s, fps: int, quality: int, stop: threading.Event,
                     geom["left"] = mon.get("left", 0)
                     geom["top"] = mon.get("top", 0)
                     geom["scale"] = scale
-                buf = io.BytesIO()
-                img.save(buf, format="JPEG", quality=quality)
-                data = buf.getvalue()
+                if codec == "h264":
+                    if enc is None or enc_size != (img.width, img.height):
+                        import screen_h264
+                        enc = screen_h264.H264Encoder(img.width, img.height, fps, quality)
+                        enc_size = (img.width, img.height)
+                    payloads = enc.encode(img)
+                else:
+                    buf = io.BytesIO()
+                    img.save(buf, format="JPEG", quality=quality)
+                    payloads = [buf.getvalue()]
             except Exception as exc:
                 # Transient (desktop switch, resolution change, secure-desktop
                 # BitBlt). Log sparsely, rebuild the grabber, and keep going.
@@ -654,15 +686,25 @@ def _capture_loop(s, fps: int, quality: int, stop: threading.Event,
                 time.sleep(0.2)
                 continue
             fails = 0
-            if not _send(data):
+            closed = False
+            for _data in payloads:
+                if not _send(_data):
+                    closed = True
+                    break
+            if closed:
                 reason = "viewer/socket closed"
                 break
+            if not payloads:
+                # Encoder is buffering (no output for this frame yet).
+                time.sleep(max(0.0, interval - (time.monotonic() - t0)))
+                continue
             frames += 1
+            _nbytes = sum(len(p) for p in payloads)
             if frames == 1:
                 _hlog(f"first frame sent ({img.width}x{img.height} @scale {scale:.2f}, "
-                      f"{len(data)} bytes)")
+                      f"codec={codec}, {_nbytes} bytes)")
             elif frames % 200 == 0:
-                _hlog(f"{frames} frames sent (last {img.width}x{img.height}, {len(data)} bytes)")
+                _hlog(f"{frames} frames sent (last {img.width}x{img.height}, {_nbytes} bytes)")
             # Pace to the target fps but subtract the time already spent grabbing
             # and encoding, so a slow frame doesn't stack on top of a full
             # interval (which capped the real rate well below the requested fps).
@@ -779,9 +821,11 @@ def run_screen_helper(argv) -> None:
             max_edge = max(320, min(int(argv[i + 6]), 4096)) if len(argv) > i + 6 else _MAX_EDGE
         except Exception:
             max_edge = _MAX_EDGE
+        codec = argv[i + 7] if len(argv) > i + 7 else "jpeg"
     except Exception:
         return
-    _hlog(f"helper started (mode={mode}, fps={fps}, quality={quality}, max_edge={max_edge})")
+    _hlog(f"helper started (mode={mode}, fps={fps}, quality={quality}, "
+          f"max_edge={max_edge}, codec={codec})")
     try:
         s = socket.create_connection(("127.0.0.1", port), timeout=15)
     except Exception as exc:
@@ -825,14 +869,14 @@ def run_screen_helper(argv) -> None:
     _hlog(f"consent banner {'enabled' if show_banner else 'disabled'} for this session")
     if show_banner:
         cap = threading.Thread(target=_capture_loop,
-                               args=(s, fps, quality, stop, geom, send_lock, max_edge),
+                               args=(s, fps, quality, stop, geom, send_lock, max_edge, codec),
                                daemon=True)
         cap.start()
         _show_consent_banner(stop)
         stop.set()
         cap.join(timeout=5)
     else:
-        _capture_loop(s, fps, quality, stop, geom, send_lock, max_edge)
+        _capture_loop(s, fps, quality, stop, geom, send_lock, max_edge, codec)
     _hlog("helper exiting")
 
     try:
