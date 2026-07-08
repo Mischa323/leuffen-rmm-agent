@@ -43,7 +43,9 @@ jobs:
           python-version: "3.12"
 
       - name: Install build deps
-        run: pip install pyinstaller websockets psutil pystray pillow mss pynput
+        # 'av' (PyAV) provides H.264 encoding for the remote-desktop stream; it
+        # bundles ffmpeg (~30-50 MB). The agent falls back to JPEG without it.
+        run: pip install pyinstaller websockets psutil pystray pillow mss pynput av
 
       - name: Generate app icon
         # The .ico is drawn programmatically (no binary committed to the repo).
@@ -86,7 +88,9 @@ jobs:
         # --onedir (not --onefile): a self-extracting onefile exe is the biggest
         # trigger for Defender's Bearfoos.B!ml ML false positive on PyInstaller
         # apps. Onedir ships a plain folder (exe + _internal\) instead.
-        run: pyinstaller --onedir --noconsole --icon ..\packaging\windows\leuffen.ico --name leuffen-rmm-agent --paths . --collect-submodules mss --collect-submodules pynput --hidden-import PIL.Image --add-data "..\packaging\windows\LibreHardwareMonitorLib.dll;." --add-data "..\packaging\windows\HidSharp.dll;." --add-data "..\packaging\windows\nmap-mac-prefixes;." agent.py
+        # --collect-all av bundles PyAV's ffmpeg DLLs (H.264 encode); without it
+        # the agent still runs and falls back to JPEG.
+        run: pyinstaller --onedir --noconsole --icon ..\packaging\windows\leuffen.ico --name leuffen-rmm-agent --paths . --collect-submodules mss --collect-submodules pynput --collect-all av --hidden-import PIL.Image --add-data "..\packaging\windows\LibreHardwareMonitorLib.dll;." --add-data "..\packaging\windows\HidSharp.dll;." --add-data "..\packaging\windows\nmap-mac-prefixes;." agent.py
 
       - name: Build tray exe
         working-directory: agent
