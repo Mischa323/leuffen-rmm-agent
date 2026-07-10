@@ -751,67 +751,82 @@ def _show_consent_banner(stop: threading.Event) -> None:
     except Exception:
         stop.wait()
         return
-    try:
-        root = tk.Tk()
-    except Exception:
-        stop.wait()
-        return
-    try:
-        root.title("Leuffen RMM — remote session")
-        root.overrideredirect(True)        # borderless banner
-        root.attributes("-topmost", True)  # stay above other windows
+    import time as _time
+
+    # The banner is re-shown if its window closes for any reason OTHER than the
+    # user clicking Disconnect (e.g. Windows switching the interactive desktop
+    # when the machine goes idle, or a screensaver kicking in). A transient banner
+    # loss must NOT tear down the remote session — that was causing sessions on an
+    # unattended machine to drop every 20-50s ("ended at the device").
+    disconnected = [False]
+    while not stop.is_set():
         try:
-            root.attributes("-toolwindow", True)  # keep it off the taskbar (Windows)
+            root = tk.Tk()
         except Exception:
-            pass
-
-        bg = "#b00020"  # alert red
-        frame = tk.Frame(root, bg=bg, padx=14, pady=10)
-        frame.pack(fill="both", expand=True)
-        tk.Label(
-            frame,
-            text="●  Remote support is connected — someone can see and control this screen.",
-            bg=bg, fg="white",
-            font=("Segoe UI", 10, "bold"),
-        ).pack(side="left", padx=(0, 14))
-
-        def _disconnect(*_):
-            stop.set()
+            stop.wait()
+            return
+        try:
+            root.title("Leuffen RMM — remote session")
+            root.overrideredirect(True)        # borderless banner
+            root.attributes("-topmost", True)  # stay above other windows
             try:
-                root.destroy()
+                root.attributes("-toolwindow", True)  # keep it off the taskbar (Windows)
             except Exception:
                 pass
 
-        tk.Button(
-            frame, text="Disconnect", command=_disconnect,
-            bg="white", fg=bg, font=("Segoe UI", 10, "bold"),
-            relief="flat", padx=12, pady=2, cursor="hand2",
-        ).pack(side="right")
+            bg = "#b00020"  # alert red
+            frame = tk.Frame(root, bg=bg, padx=14, pady=10)
+            frame.pack(fill="both", expand=True)
+            tk.Label(
+                frame,
+                text="●  Remote support is connected — someone can see and control this screen.",
+                bg=bg, fg="white",
+                font=("Segoe UI", 10, "bold"),
+            ).pack(side="left", padx=(0, 14))
 
-        # Top-centre of the primary monitor.
-        root.update_idletasks()
-        w = max(root.winfo_reqwidth(), 460)
-        h = max(root.winfo_reqheight(), 48)
-        sw = root.winfo_screenwidth()
-        root.geometry(f"{w}x{h}+{(sw - w) // 2}+24")
-
-        # Close the banner if capture stops for any other reason (operator ended
-        # the session, socket dropped, etc.).
-        def _poll():
-            if stop.is_set():
+            def _disconnect(*_):
+                disconnected[0] = True
+                stop.set()
                 try:
                     root.destroy()
                 except Exception:
                     pass
-                return
-            root.after(400, _poll)
 
-        root.after(400, _poll)
-        root.mainloop()
-    except Exception:
-        pass
-    finally:
-        stop.set()
+            tk.Button(
+                frame, text="Disconnect", command=_disconnect,
+                bg="white", fg=bg, font=("Segoe UI", 10, "bold"),
+                relief="flat", padx=12, pady=2, cursor="hand2",
+            ).pack(side="right")
+
+            # Top-centre of the primary monitor.
+            root.update_idletasks()
+            w = max(root.winfo_reqwidth(), 460)
+            h = max(root.winfo_reqheight(), 48)
+            sw = root.winfo_screenwidth()
+            root.geometry(f"{w}x{h}+{(sw - w) // 2}+24")
+
+            # Close the banner promptly once the session is genuinely ending.
+            def _poll():
+                if stop.is_set():
+                    try:
+                        root.destroy()
+                    except Exception:
+                        pass
+                    return
+                root.after(400, _poll)
+
+            root.after(400, _poll)
+            root.mainloop()
+        except Exception:
+            pass
+        if disconnected[0] or stop.is_set():
+            break
+        # Window closed on its own (not a Disconnect) — keep the session alive and
+        # re-show the banner shortly. The brief pause avoids a busy loop if Tk
+        # can't stay up at all.
+        _hlog("consent banner closed unexpectedly; re-showing (session continues)")
+        _time.sleep(1.5)
+    stop.set()
 
 
 def run_screen_helper(argv) -> None:
