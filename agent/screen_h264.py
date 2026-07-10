@@ -18,13 +18,26 @@ from __future__ import annotations
 from fractions import Fraction
 
 
+_import_error: str | None = None
+
+
 def available() -> bool:
-    """True if H.264 encoding is possible in this build (PyAV present)."""
+    """True if H.264 encoding is possible in this build (PyAV present). Records
+    the import failure (see :func:`import_error`) so the streamer can log *why* it
+    fell back to JPEG — PyInstaller can bundle ``av`` but miss a transitive DLL."""
+    global _import_error
     try:
         import av  # noqa: F401
+        _import_error = None
         return True
-    except Exception:
+    except Exception as e:  # pragma: no cover
+        _import_error = repr(e)
         return False
+
+
+def import_error() -> str | None:
+    """The last PyAV import error string (None if it imported fine)."""
+    return _import_error
 
 
 # WebCodecs codec string the browser configures its decoder with. We pin the

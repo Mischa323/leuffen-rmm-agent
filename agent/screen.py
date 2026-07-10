@@ -383,7 +383,11 @@ class ScreenSession:
         # Wire codec: H.264 when the viewer supports it (WebCodecs) AND this build
         # can encode it (PyAV present); otherwise full-frame JPEG (the fallback).
         want_h264 = bool(codecs) and "h264" in codecs
-        self.codec = "h264" if (want_h264 and screen_h264.available()) else "jpeg"
+        h264_ok = screen_h264.available()
+        self.codec = "h264" if (want_h264 and h264_ok) else "jpeg"
+        _hlog(f"codec decision: requested={codecs} want_h264={want_h264} "
+              f"h264_available={h264_ok} chosen={self.codec}"
+              + (f" av_error={screen_h264.import_error()}" if (want_h264 and not h264_ok) else ""))
         self._task: asyncio.Task | None = None
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
