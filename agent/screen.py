@@ -383,7 +383,11 @@ class ScreenSession:
         # Wire codec: H.264 when the viewer supports it (WebCodecs) AND this build
         # can encode it (PyAV present); otherwise full-frame JPEG (the fallback).
         want_h264 = bool(codecs) and "h264" in codecs
-        self.codec = "h264" if (want_h264 and screen_h264.available()) else "jpeg"
+        h264_ok = screen_h264.available()
+        self.codec = "h264" if (want_h264 and h264_ok) else "jpeg"
+        _hlog(f"codec decision: requested={codecs} want_h264={want_h264} "
+              f"h264_available={h264_ok} chosen={self.codec}"
+              + (f" av_error={screen_h264.import_error()}" if (want_h264 and not h264_ok) else ""))
         self._task: asyncio.Task | None = None
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -456,6 +460,7 @@ class ScreenSession:
             self._sock = conn
             # Relay helper -> viewer until stopped or the helper disconnects. Both
             # JPEG frames and the LRMMCLIP clipboard blob are forwarded as binary.
+            broke_on_send = False
             while not self._stop:
                 frame = _recv_msg(conn)
                 if frame is None:
@@ -464,12 +469,20 @@ class ScreenSession:
                 try:
                     fut.result(timeout=15)
                 except Exception:
+                    broke_on_send = True
                     break
             if not self._stop:
-                # The helper went away on its own -- most often because the user
-                # at the device clicked Disconnect on the consent banner. Tell the
-                # operator clearly (not as a "capture failed" error).
-                self._notify("The remote session was ended at the device.")
+                if broke_on_send:
+                    # A frame couldn't be delivered within the timeout — the link
+                    # is too slow for the current quality (the stream backs up),
+                    # NOT an operator ending the session. Say so, so it isn't
+                    # misread as someone clicking Disconnect at the device.
+                    _hlog("bridge: frame send stalled >15s (link too slow for the quality)")
+                    self._notify("Connection stalled — try a lower quality preset if this keeps happening.")
+                else:
+                    # The helper closed cleanly — usually the person at the device
+                    # clicked Disconnect on the consent banner.
+                    self._notify("The remote session was ended at the device.")
         except Exception as exc:
             self._fail(f"capture bridge error: {exc}")
         finally:
