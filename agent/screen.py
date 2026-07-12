@@ -480,8 +480,12 @@ class ScreenSession:
                     _hlog("bridge: frame send stalled >15s (link too slow for the quality)")
                     self._notify("Connection stalled — try a lower quality preset if this keeps happening.")
                 else:
-                    # The helper closed cleanly — usually the person at the device
-                    # clicked Disconnect on the consent banner.
+                    # The helper closed cleanly — the person at the device clicked
+                    # Disconnect on the consent banner, OR the helper's capture/input
+                    # threads wound down (see the helper's own screen.log lines for
+                    # the precise reason).
+                    _hlog("bridge: helper closed the capture socket "
+                          "(reported to viewer as 'ended at the device')")
                     self._notify("The remote session was ended at the device.")
         except Exception as exc:
             self._fail(f"capture bridge error: {exc}")
@@ -629,6 +633,9 @@ def _capture_loop(s, fps: int, quality: int, stop: threading.Event,
     reason = "stopped"
     enc = None          # lazily-created H.264 encoder (recreated on size change)
     enc_size = None
+    hb_frames = 0       # frames/bytes since the last heartbeat log
+    hb_bytes = 0
+    hb_last = 0.0
 
     def _send(data: bytes) -> bool:
         if send_lock is not None:
@@ -713,11 +720,24 @@ def _capture_loop(s, fps: int, quality: int, stop: threading.Event,
                 continue
             frames += 1
             _nbytes = sum(len(p) for p in payloads)
+            hb_frames += 1
+            hb_bytes += _nbytes
+            _now2 = time.monotonic()
             if frames == 1:
                 _hlog(f"first frame sent ({img.width}x{img.height} @scale {scale:.2f}, "
                       f"codec={codec}, {_nbytes} bytes)")
-            elif frames % 200 == 0:
-                _hlog(f"{frames} frames sent (last {img.width}x{img.height}, {_nbytes} bytes)")
+                hb_last = _now2
+            elif _now2 - hb_last >= 10.0:
+                # Time-based heartbeat: shows the real fps/throughput over the last
+                # window, so a stall (fps -> 0) or a healthy stream is visible right
+                # up to the moment a session drops.
+                _dt = _now2 - hb_last
+                _hlog(f"streaming: {frames} total, {hb_frames / _dt:.1f} fps, "
+                      f"{hb_bytes / 1024 / _dt:.0f} KB/s, codec={codec}, "
+                      f"last {img.width}x{img.height}")
+                hb_frames = 0
+                hb_bytes = 0
+                hb_last = _now2
             # Pace to the target fps but subtract the time already spent grabbing
             # and encoding, so a slow frame doesn't stack on top of a full
             # interval (which capped the real rate well below the requested fps).
@@ -859,6 +879,15 @@ def run_screen_helper(argv) -> None:
     except Exception as exc:
         _hlog(f"helper could not connect to the bridge: {exc!r}")
         return
+    # create_connection leaves its 15s timeout ON the socket. The input channel is
+    # sporadic — an operator who is only *watching* sends nothing for long stretches
+    # — and _recv_exact turns ANY exception (incl. socket.timeout) into None, which
+    # the input reader treats as EOF and ends the session. That silently killed
+    # unattended sessions ~15-50s after the last input ("the remote session was
+    # ended at the device"). Clear the timeout: a real dead socket still yields an
+    # empty recv (true EOF); idle no longer looks like a disconnect.
+    s.settimeout(None)
+    _hlog(f"helper connected to bridge (input timeout cleared); mode next")
     if not _send_msg(s, token.encode("utf-8")):
         _hlog("helper failed to send auth token")
         try:
@@ -877,10 +906,14 @@ def run_screen_helper(argv) -> None:
                  "sock": s, "sendlock": send_lock}
 
     def _input_reader():
+        n_in = 0
         while not stop.is_set():
             data = _recv_msg(s)
             if data is None:
+                _hlog(f"input channel closed (loopback EOF after {n_in} events); "
+                      f"stopping session")
                 break
+            n_in += 1
             try:
                 _inject(json.loads(data.decode("utf-8", "replace")), inj_state)
             except Exception:
