@@ -165,6 +165,32 @@ def _ws_url(server_url: str, api_key: str) -> str:
     return f"{base}/api/agents/ws?key={api_key}"
 
 
+def _url_host(server_url: str) -> str:
+    """Bare hostname of the server URL, for clearer connection diagnostics."""
+    from urllib.parse import urlparse
+    try:
+        return urlparse(server_url).hostname or server_url
+    except Exception:
+        return server_url
+
+
+def _is_dns_error(exc: BaseException) -> bool:
+    """True if a connection failure is a name-resolution failure (rather than a
+    refused/timed-out connection), so it can be logged distinctly. Walks the
+    exception chain and, as a fallback, matches the platform gaierror strings."""
+    seen = 0
+    cur: BaseException | None = exc
+    while cur is not None and seen < 8:
+        if isinstance(cur, socket.gaierror):
+            return True
+        cur = cur.__cause__ or cur.__context__
+        seen += 1
+    text = str(exc).lower()
+    return any(s in text for s in (
+        "getaddrinfo failed", "name or service not known", "temporary failure in name resolution",
+        "nodename nor servname", "name does not resolve", "[errno 11001]", "[errno -2]", "-3] temporary"))
+
+
 def _lower_priority() -> None:
     try:
         p = psutil.Process()
@@ -628,6 +654,7 @@ class Agent:
     async def run(self) -> None:
         _lower_priority()
         url = _ws_url(self.cfg["server_url"], self.cfg["api_key"])
+        host = _url_host(self.cfg["server_url"])
         ssl_ctx = self._ssl_context(url)
         backoff = 2
         self._write_status(False)
@@ -644,7 +671,16 @@ class Agent:
                     await asyncio.gather(self._metrics_loop(), self._recv_loop(),
                                          self._control_loop(), self._snmp_loop())
             except Exception as exc:
-                log.warning("connection lost (%s); retrying in %ss", exc, backoff)
+                if _is_dns_error(exc):
+                    # Distinct from a refused/timed-out server: the hostname itself
+                    # won't resolve (dead/wrong DNS, or the server's DNS record was
+                    # removed). Surfaces the same failure operators see as the
+                    # browser's "server not found".
+                    log.warning("DNS resolution failed for %r — cannot reach the "
+                                "server by name (check DNS / the server hostname); "
+                                "retrying in %ss", host, backoff)
+                else:
+                    log.warning("connection lost (%s); retrying in %ss", exc, backoff)
                 self._write_status(False)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60)
