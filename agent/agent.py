@@ -1043,8 +1043,8 @@ def _setup_file_logging() -> None:
     try:
         from logging.handlers import RotatingFileHandler
         path = os.path.join(_data_dir(), "agent.log")
-        # Cap total log files at 10 (active + 9 rotated), ~1 MB each.
-        handler = RotatingFileHandler(path, maxBytes=1_000_000, backupCount=9, encoding="utf-8")
+        # Cap total log files at 10 (active + 9 rotated), ~50 KB each.
+        handler = RotatingFileHandler(path, maxBytes=50_000, backupCount=9, encoding="utf-8")
         handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
         logging.getLogger().addHandler(handler)
         log.info("Leuffen RMM agent — logging to %s", path)
