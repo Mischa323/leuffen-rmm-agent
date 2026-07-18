@@ -64,6 +64,7 @@ def _data_dir() -> str:
 STATUS_PATH = os.path.join(_data_dir(), "status.json")
 CONFIG_PATH = os.path.join(_data_dir(), "rmm_config.json")
 SYNC_FLAG   = os.path.join(_data_dir(), "sync_request")
+NOTIFY_PATH = os.path.join(_data_dir(), "notify.json")
 
 
 def _read_status() -> dict:
@@ -481,6 +482,21 @@ class Tray:
     def _quit(self, icon=None, item=None):
         self.icon.stop()
 
+    def _check_notify(self, icon):
+        """Show any desktop notification the agent queued (updates ready, etc.),
+        then clear it. Stale (>5 min) notifications are dropped, not shown late."""
+        try:
+            if not os.path.exists(NOTIFY_PATH):
+                return
+            with open(NOTIFY_PATH) as f:
+                n = json.load(f)
+            os.remove(NOTIFY_PATH)
+            body = (n.get("body") or "").strip()
+            if body and (time.time() - float(n.get("ts") or 0)) < 300:
+                icon.notify(body, n.get("title") or "Leuffen RMM")
+        except Exception:
+            pass
+
     def _refresh(self, icon):
         icon.visible = True
         while True:
@@ -489,6 +505,7 @@ class Tray:
             icon.icon = _logo(self._connected())
             icon.menu = self._menu()
             icon.update_menu()
+            self._check_notify(icon)
 
     def run(self):
         self.icon.run(setup=self._refresh)
