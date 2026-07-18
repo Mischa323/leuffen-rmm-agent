@@ -587,6 +587,11 @@ def _sync_flag_path() -> str:
     return os.path.join(_data_dir(), "sync_request")
 
 
+def _notify_path() -> str:
+    # A queued desktop notification the tray (running in the user session) shows.
+    return os.path.join(_data_dir(), "notify.json")
+
+
 class Agent:
     def __init__(self, cfg: dict):
         self.cfg = cfg
@@ -605,6 +610,15 @@ class Agent:
                 json.dump({"connected": connected, "last_sync": self.last_sync,
                            "server_url": self.cfg.get("server_url"),
                            "hostname": socket.gethostname(), "updated": time.time()}, f)
+        except Exception:
+            pass
+
+    def _write_notify(self, title: str, body: str) -> None:
+        """Queue a desktop notification for the per-user tray to show (best effort;
+        the agent runs as SYSTEM and can't raise UI in the user's session itself)."""
+        try:
+            with open(_notify_path(), "w") as f:
+                json.dump({"title": title, "body": body, "ts": time.time()}, f)
         except Exception:
             pass
 
@@ -834,6 +848,11 @@ class Agent:
                 await self._ack(rid, {"ok": True})
             except Exception as exc:
                 await self._ack(rid, {"ok": False, "error": str(exc)})
+        elif t == "notify":
+            # Show a desktop toast to the signed-in user. The agent runs as SYSTEM
+            # (no UI), so drop it for the per-user tray to display.
+            self._write_notify(msg.get("title") or "Leuffen RMM", msg.get("body") or "")
+            await self._ack(rid, {"ok": True})
         elif t == "update_agent":
             asyncio.create_task(self._self_update(msg, rid))
         elif t == "scan":

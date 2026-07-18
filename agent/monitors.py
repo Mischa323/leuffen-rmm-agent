@@ -19,6 +19,7 @@ import os
 import platform
 import re
 import subprocess
+import threading
 import time
 
 try:
@@ -214,6 +215,64 @@ def process_names() -> list[str] | None:
 
 
 # --------------------------------------------------------------------------- #
+# Available OS updates (Windows Update / apt / dnf-yum)
+# --------------------------------------------------------------------------- #
+# The update probe is slow and network-bound, so it runs in a background thread
+# and is refreshed at most every _UPDATES_TTL; ``updates_available()`` only ever
+# returns the cached value and never blocks a heartbeat (a slow probe must not
+# delay metrics and trip a false 'offline').
+_UPDATES_TTL = 6 * 3600.0
+_UPDATES_BACKOFF = 1800.0   # retry sooner while we still have no count
+_updates_state: dict = {"count": None, "ts": 0.0, "running": False}
+
+
+def _win_updates() -> int | None:
+    txt = _ps(
+        "try{$s=New-Object -ComObject Microsoft.Update.Session;"
+        "$r=$s.CreateUpdateSearcher().Search(\"IsInstalled=0 and IsHidden=0 and Type='Software'\");"
+        "[Console]::Out.Write($r.Updates.Count)}catch{}", 120)
+    txt = (txt or "").strip()
+    return int(txt) if txt.isdigit() else None
+
+
+def _linux_updates() -> int | None:
+    if os.path.exists("/usr/bin/apt-get"):
+        txt = _run(["apt-get", "-s", "-o", "Debug::NoLocking=true", "upgrade"], 60)
+        if txt:
+            return sum(1 for ln in txt.splitlines() if ln.startswith("Inst "))
+    for tool in ("/usr/bin/dnf", "/usr/bin/yum"):
+        if os.path.exists(tool):
+            txt = _run([tool, "-q", "check-update"], 90)
+            return sum(1 for ln in txt.splitlines()
+                       if ln.strip() and len(ln.split()) >= 3
+                       and not ln.startswith(("Last metadata", "Obsoleting", "Security")))
+    return None
+
+
+def _refresh_updates() -> None:
+    try:
+        count = _win_updates() if _IS_WIN else _linux_updates()
+    except Exception:
+        count = None
+    _updates_state["ts"] = time.time()
+    if count is not None:
+        _updates_state["count"] = count
+    _updates_state["running"] = False
+
+
+def updates_available() -> int | None:
+    """Number of OS updates ready to install (Windows Update / apt / dnf-yum), or
+    None when it can't be determined. Non-blocking: kicks a background refresh
+    when the cached value is stale and returns whatever is cached."""
+    st = _updates_state
+    ttl = _UPDATES_TTL if st["count"] is not None else _UPDATES_BACKOFF
+    if not st["running"] and time.time() - st["ts"] >= ttl:
+        st["running"] = True
+        threading.Thread(target=_refresh_updates, daemon=True).start()
+    return st["count"]
+
+
+# --------------------------------------------------------------------------- #
 # Throttled aggregate
 # --------------------------------------------------------------------------- #
 def collect() -> dict:
@@ -231,6 +290,12 @@ def collect() -> dict:
         pass
     try:
         data["reboot_pending"] = reboot_pending()
+    except Exception:
+        pass
+    try:
+        uc = updates_available()
+        if uc is not None:
+            data["updates_available"] = uc
     except Exception:
         pass
     try:
