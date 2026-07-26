@@ -993,6 +993,33 @@ def _allow_inbound_ping() -> None:
         pass
 
 
+def _ensure_agent_restart_task() -> None:
+    """Windows: make our scheduled task self-heal so a stopped agent comes back
+    without a reboot.
+
+    The MSI registers the task with an at-startup trigger only, and Task Scheduler
+    applies its default 72-hour execution limit — so if the agent crashes/exits it
+    stays dead until the next boot, and a long-running one can even be stopped after
+    72h. Re-assert the settings here on every startup: restart on failure (every
+    5 min) and no execution-time limit. Idempotent and best-effort (agent is
+    SYSTEM); only touches Settings, never the task's action/trigger."""
+    if os.name != "nt":
+        return
+    try:
+        import subprocess
+        ps = ("Set-ScheduledTask -TaskName LeuffenRMMAgent -Settings ("
+              "New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew "
+              "-RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 5) "
+              "-ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable "
+              "-AllowStartIfOnBatteries -DontStopIfGoingOnBatteries) | Out-Null")
+        subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
+                        "-ExecutionPolicy", "Bypass", "-Command", ps],
+                       capture_output=True, timeout=30, creationflags=0x08000000)
+        log.info("ensured agent auto-restart task settings (restart-on-failure, no time limit)")
+    except Exception:
+        pass
+
+
 def _enable_wol() -> None:
     """Apply the full set of NIC settings Wake-on-LAN needs (Windows), best-effort.
 
@@ -1123,6 +1150,7 @@ def main() -> None:
     _persist_config(cfg)
     _grant_users_writable(_data_dir())
     _allow_inbound_ping()
+    _ensure_agent_restart_task()   # self-heal: restart-on-failure + no 72h limit
     # Wake-on-LAN (NIC settings + Fast Startup) is applied only when the server's
     # agent_policy enables it — not unconditionally.
     asyncio.run(Agent(cfg).run())
