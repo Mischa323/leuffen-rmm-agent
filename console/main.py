@@ -29,7 +29,9 @@ import config          # noqa: E402
 import main_window     # noqa: E402
 
 SCHEME = "leuffenrmm"
-INSTANCE_PORT = 49723
+# Overridable so a second console (a source checkout, a test run) can be
+# started alongside an installed one instead of handing it the link.
+INSTANCE_PORT = int(os.environ.get("RMM_CONSOLE_PORT", "49723"))
 INSTANCE_HOST = "127.0.0.1"
 
 

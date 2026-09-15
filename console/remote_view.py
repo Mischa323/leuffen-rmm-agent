@@ -40,6 +40,12 @@ PRESET_LABELS = {
 MAX_RECONNECT = 8
 MOVE_INTERVAL = 0.016          # ~60 pointer updates/second is plenty
 CLIP_PULL_DELAY_MS = 180       # let the remote finish copying before we read it
+# "Paste as keystrokes" limits: chunked so one long message can't stall the
+# input stream, and capped because typing is much slower than a paste.
+KEYSTROKE_CHUNK = 200
+KEYSTROKE_MAX = 10000
+CR, NEWLINE = chr(13), chr(10)
+CRLF = CR + NEWLINE
 
 # Tk keysym -> the agent's key names (`pynput` vocabulary, see screen.py).
 KEYMAP = {
@@ -171,6 +177,8 @@ class RemoteWindow(tk.Toplevel):
         self.btn_copy.pack(side="left", padx=(0, 6))
         self.btn_paste = Button(tools, "Paste to remote", self.paste_to_remote)
         self.btn_paste.pack(side="left", padx=(0, 6))
+        self.btn_type = Button(tools, "Paste as keystrokes", self.paste_as_keystrokes)
+        self.btn_type.pack(side="left", padx=(0, 6))
         Button(tools, "Ctrl+Alt+Del", self.send_cad).pack(side="left", padx=(0, 6))
         self.btn_lock = Button(tools, "Lock", self.lock_device)
         self.btn_lock.pack(side="left")
@@ -477,7 +485,12 @@ class RemoteWindow(tk.Toplevel):
             # the toolbar buttons.
             clip_only = combo <= {"ctrl", "cmd"}
             if clip_only and base == "v":
-                self.paste_to_remote()      # this computer's clipboard -> there
+                # Shift asks for the typed variant, the way remote-support tools
+                # conventionally spell it.
+                if "shift" in self._modifiers:
+                    self.paste_as_keystrokes()
+                else:
+                    self.paste_to_remote()  # this computer's clipboard -> there
                 return "break"
             keys = [m for m in ("ctrl", "alt", "cmd") if m in self._modifiers]
             if "shift" in self._modifiers:
@@ -527,6 +540,32 @@ class RemoteWindow(tk.Toplevel):
         if text:
             self._send({"kind": "clip_paste", "text": text})
             self.btn_paste.flash("Pasted")
+
+    def paste_as_keystrokes(self) -> None:
+        """Type the clipboard out instead of pasting it.
+
+        Plenty of places refuse a paste outright -- UAC prompts, the Windows
+        sign-in screen, a remote session running inside the remote session, and
+        password boxes that block pasting. Typed characters are indistinguishable
+        from someone at the keyboard, so they always land.
+        """
+        try:
+            text = self.clipboard_get()
+        except tk.TclError:
+            self.btn_type.flash("Clipboard empty")
+            return
+        if not text:
+            self.btn_type.flash("Clipboard empty")
+            return
+        # The remote presses Enter for a newline; normalise so a Windows
+        # clipboard's CRLF does not type it twice.
+        text = text.replace(CRLF, NEWLINE).replace(CR, NEWLINE)
+        clipped = len(text) > KEYSTROKE_MAX
+        text = text[:KEYSTROKE_MAX]
+        for i in range(0, len(text), KEYSTROKE_CHUNK):
+            self._send({"kind": "key", "text": text[i:i + KEYSTROKE_CHUNK]})
+        self.btn_type.flash("Typed first %d chars" % KEYSTROKE_MAX if clipped
+                            else "Typed")
 
     def lock_device(self) -> None:
         tasks.run(self, lambda: self.client.power(self.device_id, "lock"),
