@@ -1,9 +1,11 @@
 name: Auto-bump version
 
-# Increments the agent's patch version on every push to main that touches agent/.
-# AGENT_VERSION in agent/inventory.py is the single source of truth. The bump is
-# committed back to main with the default token (which does not retrigger
-# workflows, so there is no loop).
+# Increments a component's patch version on every push to main that touches it:
+#   agent/    -> AGENT_VERSION in agent/inventory.py (+ syno_inventory.py)
+#   console/  -> CONSOLE_VERSION in console/version.py
+# Each is the single source of truth for its own MSI, and the two ship and
+# version independently. The bump is committed back to main with the default
+# token (which does not retrigger workflows, so there is no loop).
 
 on:
   push:
@@ -35,6 +37,7 @@ jobs:
           fi
           FILES="$(git diff --name-only "$BEFORE" "${{ github.sha }}" || true)"
           echo "agent=$(echo "$FILES" | grep -q '^agent/' && echo yes || echo no)" >> "$GITHUB_OUTPUT"
+          echo "console=$(echo "$FILES" | grep -q '^console/' && echo yes || echo no)" >> "$GITHUB_OUTPUT"
 
       - name: Bump agent version
         if: steps.changes.outputs.agent == 'yes'
@@ -48,6 +51,15 @@ jobs:
           sed -i "s/AGENT_VERSION = \"$cur\"/AGENT_VERSION = \"$new\"/" agent/inventory.py agent/syno_inventory.py
           echo "Agent: $cur -> $new"
 
+      - name: Bump console version
+        if: steps.changes.outputs.console == 'yes'
+        run: |
+          cur="$(grep -oP 'CONSOLE_VERSION\s*=\s*"\K[^"]+' console/version.py)"
+          IFS=. read -r MA MI PA <<< "$cur"
+          new="$MA.$MI.$((PA + 1))"
+          sed -i "s/CONSOLE_VERSION = \"$cur\"/CONSOLE_VERSION = \"$new\"/" console/version.py
+          echo "Console: $cur -> $new"
+
       - name: Commit bump
         run: |
           if git diff --quiet; then
@@ -56,6 +68,6 @@ jobs:
           fi
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add agent/inventory.py agent/syno_inventory.py
+          git add agent/inventory.py agent/syno_inventory.py console/version.py
           git commit -m "chore: auto version bump [version bump]"
           git push origin HEAD:main

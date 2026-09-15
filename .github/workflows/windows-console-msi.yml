@@ -1,0 +1,115 @@
+name: Build Windows console MSI
+
+# Builds the technician-side desktop console (PyInstaller) and wraps it in an
+# MSI (WiX v5), published to a GitHub Release tagged `console-v<CONSOLE_VERSION>`.
+#
+# The console ships from this repo alongside the agent but versions and releases
+# independently -- hence its own tag prefix. The server finds the newest release
+# carrying `leuffen-rmm-console.msi` (see `_console_release` in the server), so
+# agent releases in between never shadow it.
+#
+# Optional code signing: identical to the agent workflow -- if the repo has
+# WINDOWS_CERT_PFX_BASE64 / WINDOWS_CERT_PASSWORD, the exe and MSI are signed.
+
+on:
+  push:
+    tags: ["console-v*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build-msi:
+    runs-on: windows-latest
+    env:
+      HAS_CERT: ${{ secrets.WINDOWS_CERT_PFX_BASE64 != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version
+        id: ver
+        shell: pwsh
+        run: |
+          # Source of truth is CONSOLE_VERSION in console/version.py.
+          $v = ((Get-Content console/version.py -Raw) -match 'CONSOLE_VERSION\s*=\s*"([^"]+)"') `
+               ? $Matches[1] : '0.0.0'
+          "ver=$v"  | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "msi=$v.0" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build deps
+        # Pinned to the same versions the agent is built against: the console
+        # speaks the agent's WebSocket protocol and decodes the same H.264
+        # stream, so a version skew between the two would show up as a
+        # remote-desktop bug rather than a build failure.
+        run: pip install pyinstaller websockets==14.1 pillow==11.1.0 av==13.1.0
+
+      - name: Generate app icon
+        run: python packaging/windows/make_icon.py
+
+      - name: Build console exe
+        # --onedir for the same Defender reason as the agent. `--collect-all av`
+        # bundles PyAV's ffmpeg DLLs (H.264 decode); without them the console
+        # still works and the session falls back to JPEG.
+        run: >
+          pyinstaller --onedir --noconsole --icon packaging\windows\leuffen.ico
+          --name leuffen-rmm-console --paths console --collect-all av
+          --hidden-import PIL.Image --hidden-import PIL.ImageTk
+          --add-data "packaging\windows\leuffen.ico;."
+          console\main.py
+
+      - name: Prepare signing certificate
+        if: env.HAS_CERT == 'true'
+        env:
+          PFX: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+        run: |
+          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\cert.pfx", [Convert]::FromBase64String($env:PFX))
+          $st = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" |
+                 Sort-Object FullName -Descending | Select-Object -First 1).FullName
+          "SIGNTOOL=$st" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Sign console exe
+        if: env.HAS_CERT == 'true'
+        env:
+          PW: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: >
+          & "$env:SIGNTOOL" sign /f "$env:RUNNER_TEMP\cert.pfx" /p "$env:PW"
+          /fd sha256 /tr http://timestamp.sectigo.com /td sha256
+          dist\leuffen-rmm-console\leuffen-rmm-console.exe
+
+      - name: Install WiX
+        run: dotnet tool install --global wix --version 5.0.2
+
+      - name: Build MSI
+        run: |
+          # Stage the onedir payload for WiX to harvest (<Files Include="console-app\**">).
+          New-Item -ItemType Directory -Force packaging\windows\console-app | Out-Null
+          Copy-Item dist\leuffen-rmm-console\* packaging\windows\console-app\ -Recurse -Force
+          (Get-Content packaging\windows\console.wxs) -replace 'Version="1.0.0.0"', 'Version="${{ steps.ver.outputs.msi }}"' | Set-Content packaging\windows\console.wxs
+          wix build packaging\windows\console.wxs -b packaging\windows -o leuffen-rmm-console.msi
+
+      - name: Sign MSI
+        if: env.HAS_CERT == 'true'
+        env:
+          PW: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: >
+          & "$env:SIGNTOOL" sign /f "$env:RUNNER_TEMP\cert.pfx" /p "$env:PW"
+          /fd sha256 /tr http://timestamp.sectigo.com /td sha256
+          leuffen-rmm-console.msi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: leuffen-rmm-console-msi
+          path: leuffen-rmm-console.msi
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('console-v{0}', steps.ver.outputs.ver) }}
+          name: Leuffen RMM Console ${{ steps.ver.outputs.msi }}
+          files: leuffen-rmm-console.msi
+          fail_on_unmatched_files: true

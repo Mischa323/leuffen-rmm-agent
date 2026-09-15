@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+dist/
+build/
+*.spec
+
+# PyInstaller staging + build-time downloads (CI writes these next to the .wxs)
+packaging/windows/app/
+packaging/windows/console-app/
+packaging/windows/*.ico
+packaging/windows/*.dll
+packaging/windows/nmap-mac-prefixes
+
+# Local agent state from running the agent out of a checkout
+agent/rmm_config.json
+agent/rmm_device_id
+agent/status.json
+agent/sync_request
+agent/agent.log*

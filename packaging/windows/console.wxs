@@ -1,0 +1,103 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Leuffen RMM desktop console MSI (WiX v5). The technician-side app: the native
+  counterpart of the web dashboard's remote control, terminal and file browser.
+
+  Built in CI on a Windows runner around the PyInstaller *onedir* output, for
+  the same reason the agent is (a self-extracting onefile exe is the biggest
+  trigger for Defender's Bearfoos.B!ml false positive on PyInstaller apps).
+
+  Unlike the agent MSI there is nothing to configure at install time: the app
+  asks for the server on first run, or is handed one by the dashboard through
+  the `leuffenrmm://` protocol this package registers.
+
+    msiexec /i leuffen-rmm-console.msi /qn
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="Leuffen RMM Console" Manufacturer="Leuffen IT"
+           Version="1.0.0.0" UpgradeCode="a4c71f28-6b93-4e55-8f0d-3d7c9e21b455"
+           Scope="perMachine">
+    <MajorUpgrade AllowSameVersionUpgrades="yes" DowngradeErrorMessage="A newer version of the Leuffen RMM console is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Property Id="ARPURLINFOABOUT" Value="https://leuffen.it" />
+    <Property Id="ARPHELPLINK" Value="https://leuffen.it" />
+    <Icon Id="leuffen.ico" SourceFile="leuffen.ico" />
+    <Property Id="ARPPRODUCTICON" Value="leuffen.ico" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Leuffen RMM Console" />
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="AppMenuFolder" Name="Leuffen RMM" />
+    </StandardDirectory>
+    <StandardDirectory Id="DesktopFolder" />
+
+    <!-- PyInstaller onedir payload (exe + _internal\*), staged into
+         packaging\windows\console-app by CI and harvested wholesale. -->
+    <ComponentGroup Id="ConsoleFiles" Directory="INSTALLFOLDER">
+      <Files Include="console-app\**" />
+    </ComponentGroup>
+
+    <DirectoryRef Id="INSTALLFOLDER">
+      <!-- The `leuffenrmm://` URL scheme. This is what makes the dashboard's
+           "Open in desktop app" work: the browser hands the URL (carrying a
+           single-use sign-in ticket and the device id) to this exe. -->
+      <Component Id="ProtocolHandler" Guid="d58e0b73-2f14-4a96-b3c7-6e0a95d4f812">
+        <RegistryKey Root="HKLM" Key="Software\Classes\leuffenrmm">
+          <RegistryValue Type="string" Value="URL:Leuffen RMM Console" KeyPath="yes" />
+          <RegistryValue Name="URL Protocol" Type="string" Value="" />
+          <RegistryValue Key="DefaultIcon" Type="string"
+                         Value="&quot;[INSTALLFOLDER]leuffen-rmm-console.exe&quot;,0" />
+          <RegistryValue Key="shell\open\command" Type="string"
+                         Value="&quot;[INSTALLFOLDER]leuffen-rmm-console.exe&quot; &quot;%1&quot;" />
+        </RegistryKey>
+      </Component>
+    </DirectoryRef>
+
+    <Component Id="StartMenuShortcut" Directory="AppMenuFolder"
+               Guid="e71c4a09-5d82-4b31-9c66-84f2b0d7e513">
+      <Shortcut Id="ConsoleStartMenu" Name="Leuffen RMM Console"
+                Description="Remote control, terminal and file transfer for managed devices"
+                Target="[INSTALLFOLDER]leuffen-rmm-console.exe"
+                WorkingDirectory="INSTALLFOLDER" Icon="leuffen.ico" />
+      <RemoveFolder Id="RemoveAppMenuFolder" Directory="AppMenuFolder" On="uninstall" />
+      <RegistryValue Root="HKLM" Key="Software\LeuffenRMM\Console" Name="StartMenu"
+                     Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+
+    <Component Id="DesktopShortcut" Directory="DesktopFolder"
+               Guid="f0a93b16-7c28-44df-8ba5-1c93e7d6042a">
+      <Shortcut Id="ConsoleDesktop" Name="Leuffen RMM Console"
+                Target="[INSTALLFOLDER]leuffen-rmm-console.exe"
+                WorkingDirectory="INSTALLFOLDER" Icon="leuffen.ico" />
+      <RegistryValue Root="HKLM" Key="Software\LeuffenRMM\Console" Name="Desktop"
+                     Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+
+    <Feature Id="Main">
+      <ComponentGroupRef Id="ConsoleFiles" />
+      <ComponentRef Id="ProtocolHandler" />
+      <ComponentRef Id="StartMenuShortcut" />
+      <ComponentRef Id="DesktopShortcut" />
+    </Feature>
+
+    <!-- Same Defender false-positive mitigation as the agent MSI. Best-effort:
+         Return="ignore" so Tamper Protection can't fail the install. -->
+    <CustomAction Id="AddDefenderExclusion" Directory="INSTALLFOLDER" Impersonate="no" Execute="deferred" Return="ignore"
+      ExeCommand="powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -Command &quot;Add-MpPreference -ExclusionPath '[INSTALLFOLDER]' -ErrorAction SilentlyContinue; Add-MpPreference -ExclusionProcess 'leuffen-rmm-console.exe' -ErrorAction SilentlyContinue&quot;" />
+    <CustomAction Id="RemoveDefenderExclusion" Directory="INSTALLFOLDER" Impersonate="no" Execute="deferred" Return="ignore"
+      ExeCommand="powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -Command &quot;Remove-MpPreference -ExclusionPath '[INSTALLFOLDER]' -ErrorAction SilentlyContinue; Remove-MpPreference -ExclusionProcess 'leuffen-rmm-console.exe' -ErrorAction SilentlyContinue&quot;" />
+
+    <!-- Open the console after an interactive install so the technician can sign
+         in straight away. Silent installs (/qn) skip it. -->
+    <CustomAction Id="LaunchConsole" Directory="INSTALLFOLDER" Impersonate="yes" Execute="immediate" Return="asyncNoWait"
+      ExeCommand="&quot;[INSTALLFOLDER]leuffen-rmm-console.exe&quot;" />
+
+    <InstallExecuteSequence>
+      <Custom Action="AddDefenderExclusion" Before="InstallFiles" Condition="NOT Installed" />
+      <Custom Action="RemoveDefenderExclusion" Before="RemoveFiles" Condition="REMOVE=&quot;ALL&quot;" />
+      <Custom Action="LaunchConsole" After="InstallFinalize" Condition="NOT Installed AND UILevel &gt; 3" />
+    </InstallExecuteSequence>
+  </Package>
+</Wix>
