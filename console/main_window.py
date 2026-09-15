@@ -19,6 +19,7 @@ import remote_view
 import tasks
 import terminal_view
 import theme
+import updater
 from api import ApiError
 from theme import C, Button, Fonts
 from version import CONSOLE_VERSION
@@ -60,9 +61,93 @@ class App(tk.Tk):
         self.client: api.ApiClient | None = None
         self.view: tk.Frame | None = None
         self.sessions: list[tk.Toplevel] = []
+        self.update_bar: tk.Frame | None = None
+        self._update_version = ""
+        self._update_job = None
         self._pending_device = ""          # a deep link waiting for sign-in
         self.protocol("WM_DELETE_WINDOW", self.quit_app)
         self.deiconify()
+
+    # ------------------------------------------------------------ updates -- #
+    def start_update_checks(self) -> None:
+        """Ask the server whether a newer console has been published.
+
+        Only ever *offers* the update. Installing replaces files under Program
+        Files, which needs elevation, and a background app cannot elevate
+        without asking -- so the honest shape is a banner and one click, not a
+        silent swap that would fail with a permission error nobody sees.
+        """
+        if self._update_job is not None:
+            self.after_cancel(self._update_job)
+            self._update_job = None
+        if self.client is None or not updater.running_installed():
+            return          # a source checkout has no MSI to replace
+        tasks.run(self, lambda: updater.check(self.client),
+                  on_ok=self._offer_update, on_error=lambda _e: None)
+        self._update_job = self.after(updater.CHECK_INTERVAL_MS, self.start_update_checks)
+
+    def _offer_update(self, version: str) -> None:
+        if not version or version == self._update_version:
+            return
+        self._update_version = version
+        self._show_update_bar(f"Version {version} of the console is available.")
+
+    def _show_update_bar(self, message: str, busy: bool = False) -> None:
+        if self.update_bar is not None:
+            self.update_bar.destroy()
+        bar = tk.Frame(self, bg=theme.mix(C["accent"], C["surface"], 18))
+        bar.pack(fill="x", side="top", before=self.view if self.view else None)
+        self.update_bar = bar
+        tk.Label(bar, text=message, bg=bar["bg"], fg=C["text"], font=Fonts.ui_sm,
+                 padx=16, pady=9).pack(side="left")
+        if not busy:
+            Button(bar, "Dismiss", self._hide_update_bar, kind="ghost").pack(
+                side="right", padx=(0, 12), pady=6)
+            Button(bar, "Update now", self._run_update, kind="accent").pack(
+                side="right", padx=(0, 8), pady=6)
+
+    def _hide_update_bar(self) -> None:
+        if self.update_bar is not None:
+            self.update_bar.destroy()
+            self.update_bar = None
+
+    def _run_update(self) -> None:
+        if self.client is None:
+            return
+        if self.sessions and not messagebox.askyesno(
+                "Update the console",
+                f"{len(self.sessions)} session(s) are open. Updating closes the "
+                "console and installs the new version. Continue?", parent=self):
+            return
+        self._show_update_bar("Downloading the update\u2026", busy=True)
+
+        def progress(done: int, total: int) -> None:
+            if total:
+                self.after(0, lambda: self._update_progress(done, total))
+
+        tasks.run(self, lambda: updater.download(self.client, progress),
+                  on_ok=self._install_update, on_error=self._update_failed)
+
+    def _update_progress(self, done: int, total: int) -> None:
+        if self.update_bar is None:
+            return
+        label = self.update_bar.winfo_children()[0]
+        label.configure(text=f"Downloading the update\u2026 {done * 100 // max(total, 1)}%")
+
+    def _install_update(self, msi_path: str) -> None:
+        try:
+            updater.install(msi_path)
+        except Exception as exc:  # noqa: BLE001 -- surfaced to the user below
+            self._update_failed(exc)
+            return
+        # The installer is about to replace the files this process is running
+        # from, so get out of its way. Windows asks for permission first.
+        self._show_update_bar("Installing\u2026 the console will close.", busy=True)
+        self.after(1200, self.destroy)
+
+    def _update_failed(self, exc: Exception) -> None:
+        message = exc.message if isinstance(exc, ApiError) else str(exc)
+        self._show_update_bar(f"The update could not be installed: {message}")
 
     # -------------------------------------------------------------- views -- #
     def _swap(self, view: tk.Frame) -> None:
@@ -70,6 +155,8 @@ class App(tk.Tk):
             self.view.destroy()
         self.view = view
         view.pack(fill="both", expand=True)
+        if self.update_bar is not None:      # keep the banner above the view
+            self.update_bar.pack_configure(before=view)
 
     def show_login(self, message: str = "") -> None:
         view = login_view.LoginView(self, self)
@@ -116,6 +203,7 @@ class App(tk.Tk):
     def signed_in(self, client: api.ApiClient) -> None:
         self.client = client
         self.show_devices()
+        self.after(5000, self.start_update_checks)
         if self._pending_device:
             device_id, self._pending_device = self._pending_device, ""
             self.open_device(device_id, "remote")
@@ -129,6 +217,10 @@ class App(tk.Tk):
         self.sessions.clear()
         config.clear_token()
         self.client = None
+        self._hide_update_bar()
+        if self._update_job is not None:
+            self.after_cancel(self._update_job)
+            self._update_job = None
         self.show_login()
 
     def quit_app(self) -> None:

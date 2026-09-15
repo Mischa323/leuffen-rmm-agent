@@ -110,7 +110,7 @@ class ApiClient:
             ctx.verify_mode = ssl.CERT_NONE
         return ctx
 
-    def _opener(self) -> urllib.request.OpenerDirector:
+    def _opener(self, follow_redirects: bool = True) -> urllib.request.OpenerDirector:
         ctx, pin = self._ssl_context(), self.fingerprint
 
         def factory(host, **kw):
@@ -129,9 +129,15 @@ class ApiClient:
             def https_open(self, req):
                 return self.do_open(factory, req)
 
-        # No cookie jar and no redirect to another host: this client only ever
-        # talks to the one server it was configured with.
-        return urllib.request.build_opener(Handler(context=ctx))
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *a, **k):
+                return None
+
+        # No cookie jar: this client only ever talks to the one server it was
+        # configured with.
+        if follow_redirects:
+            return urllib.request.build_opener(Handler(context=ctx))
+        return urllib.request.build_opener(Handler(context=ctx), NoRedirect)
 
     def _url(self, path: str, params: dict | None = None) -> str:
         url = self.server_url + path
@@ -270,6 +276,47 @@ class ApiClient:
     def console_release(self) -> dict:
         return self._request("GET", "/api/console-release", timeout=15) or {}
 
+    def download_console_msi(self, target_path: str, on_progress=None) -> int:
+        """Download the console installer to `target_path`; return its size.
+
+        Two hops with different trust. The first is to our own server, which may
+        be pinned or deliberately unverified because it is self-signed. It
+        normally answers with a redirect to wherever the release actually lives
+        -- a public host, whose certificate must be checked the ordinary way.
+        Carrying our server's pin over to that host would fail, and skipping
+        verification for a download that is about to be executed would be far
+        worse, so the second hop uses a plain, fully-verifying context.
+        """
+        request = urllib.request.Request(
+            self._url("/api/console/install.msi"),
+            headers={"User-Agent": USER_AGENT,
+                     **({"Authorization": "Bearer " + self.token} if self.token else {})})
+        try:
+            with self._opener(follow_redirects=False).open(request, timeout=60) as resp:
+                if resp.status in (301, 302, 303, 307, 308):
+                    url = resp.headers.get("Location")
+                else:
+                    # A self-hosted build can serve the file directly.
+                    return _stream_to(resp, target_path, on_progress)
+        except urllib.error.HTTPError as exc:
+            if exc.code in (301, 302, 303, 307, 308):
+                url = exc.headers.get("Location")
+            else:
+                raise ApiError(exc.code, _detail(exc)) from None
+        except urllib.error.URLError as exc:
+            raise ApiError(0, _reason(exc.reason)) from None
+        if not url:
+            raise ApiError(0, "The server did not say where to download the installer")
+        try:
+            with urllib.request.urlopen(
+                    urllib.request.Request(url, headers={"User-Agent": USER_AGENT}),
+                    timeout=300) as resp:
+                return _stream_to(resp, target_path, on_progress)
+        except urllib.error.HTTPError as exc:
+            raise ApiError(exc.code, f"The installer could not be downloaded ({exc.code})") from None
+        except urllib.error.URLError as exc:
+            raise ApiError(0, _reason(exc.reason)) from None
+
     # -- websockets --------------------------------------------------------- #
     def ws_url(self, path: str, params: dict | None = None) -> str:
         """WebSocket URL with the bearer token attached.
@@ -291,6 +338,22 @@ class ApiClient:
 
     def ws_pin(self) -> str:
         return self.fingerprint
+
+
+def _stream_to(response, target_path: str, on_progress=None) -> int:
+    """Write a response body to disk in chunks, reporting progress as it goes."""
+    total = int(response.headers.get("Content-Length") or 0)
+    done = 0
+    with open(target_path, "wb") as fh:
+        while True:
+            chunk = response.read(262144)
+            if not chunk:
+                break
+            fh.write(chunk)
+            done += len(chunk)
+            if on_progress is not None:
+                on_progress(done, total)
+    return done
 
 
 def _detail(exc: urllib.error.HTTPError) -> str:

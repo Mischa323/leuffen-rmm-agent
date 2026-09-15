@@ -32,7 +32,9 @@ machine — never on a managed device.
 | Settings | `%APPDATA%\Leuffen RMM Console\settings.json` |
 | Sign-in token | `token.bin` in the same folder, encrypted with **Windows DPAPI** (current-user scope) |
 | Crash log | `console.log` in the same folder |
+| Second instance | `RMM_CONSOLE_PORT` moves the single-instance port, so a checkout can run alongside the installed console instead of handing it the deep link. |
 | Run from source | `python console/main.py` (needs `websockets`, `pillow`, optionally `av` for H.264) |
+| Updates | Checks the server every 6 hours and offers the new build in a banner. One click downloads it and hands it to `msiexec`; Windows asks for permission, because a per-machine install cannot be replaced without elevation. A source checkout is never offered one. |
 
 **How it signs in.** The console has no cookie jar, so it uses a bearer token
 from `POST /api/auth/app-token` — either by password (+ TOTP) typed into the app,
