@@ -6,4 +6,4 @@ touches `console/`, and stamps this value into the MSI's ProductVersion.
 """
 from __future__ import annotations
 
-CONSOLE_VERSION = "1.0.2"
+CONSOLE_VERSION = "1.0.3"
