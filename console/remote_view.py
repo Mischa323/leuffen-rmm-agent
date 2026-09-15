@@ -39,6 +39,7 @@ PRESET_LABELS = {
 
 MAX_RECONNECT = 8
 MOVE_INTERVAL = 0.016          # ~60 pointer updates/second is plenty
+CLIP_PULL_DELAY_MS = 180       # let the remote finish copying before we read it
 
 # Tk keysym -> the agent's key names (`pynput` vocabulary, see screen.py).
 KEYMAP = {
@@ -470,11 +471,23 @@ class RemoteWindow(tk.Toplevel):
             # control code here, so the key comes from the keysym.
             if base is None:
                 return "break"
+            # Ctrl+C / Ctrl+V are made to mean what people expect. Sent through
+            # as plain hotkeys they act only on the *remote* machine's own
+            # clipboard, so text could only cross between the two computers via
+            # the toolbar buttons.
+            clip_only = combo <= {"ctrl", "cmd"}
+            if clip_only and base == "v":
+                self.paste_to_remote()      # this computer's clipboard -> there
+                return "break"
             keys = [m for m in ("ctrl", "alt", "cmd") if m in self._modifiers]
             if "shift" in self._modifiers:
                 keys.append("shift")
             keys.append(base)
             self._send({"kind": "hotkey", "keys": keys})
+            if clip_only and base in ("c", "x"):
+                # The remote needs a moment to fill its clipboard; then mirror
+                # it into this computer's.
+                self.after(CLIP_PULL_DELAY_MS, self.copy_from_remote)
             return "break"
         if keysym in KEYMAP and keysym != "space":
             self._send({"kind": "hotkey", "keys": [KEYMAP[keysym]]})
