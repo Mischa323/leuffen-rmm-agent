@@ -1,0 +1,13 @@
+configuration:
+  server_url:
+    name: Serveradres
+    description: Je Leuffen RMM, bijvoorbeeld rmm.example.com.
+  enrolment_key:
+    name: Inschrijfsleutel
+    description: De eenmalige sleutel van de Downloads-pagina in de RMM (Home Assistant OS).
+  insecure_tls:
+    name: Zelfondertekend certificaat accepteren
+    description: Zet aan als je RMM het certificaat gebruikt dat het zelf heeft aangemaakt.
+  server_fingerprint:
+    name: Certificaat-vingerafdruk
+    description: Optioneel. Indien ingevuld wordt alleen precies dit certificaat geaccepteerd (SHA-256, uit Instellingen → Beveiliging in de RMM).

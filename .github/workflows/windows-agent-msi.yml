@@ -19,6 +19,8 @@ permissions:
 jobs:
   build-msi:
     runs-on: windows-latest
+    outputs:
+      ver: ${{ steps.ver.outputs.ver }}
     env:
       HAS_CERT: ${{ secrets.WINDOWS_CERT_PFX_BASE64 != '' }}
     steps:
@@ -153,3 +155,38 @@ jobs:
           name: Leuffen RMM Agent ${{ steps.ver.outputs.msi }}
           files: leuffen-rmm-agent.msi
           fail_on_unmatched_files: true
+
+  point-home-assistant-addon:
+    # The add-on builds on the Home Assistant box from the release tag its
+    # `version` names, so that line must only ever name a published release.
+    # Moving it here -- after the release exists -- keeps that true without a
+    # manual step, and Home Assistant then offers the update to every install.
+    needs: build-msi
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Point the add-on at v${{ needs.build-msi.outputs.ver }}
+        env:
+          VER: ${{ needs.build-msi.outputs.ver }}
+        run: |
+          set -eu
+          cfg=homeassistant/leuffen_rmm/config.yaml
+          [ -f "$cfg" ] || { echo "no add-on in this revision"; exit 0; }
+          # Only a tag that actually carries the add-on's entry point will build.
+          if ! curl -fsSI "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/v${VER}/agent/haos_agent.py" >/dev/null; then
+            echo "v${VER} has no haos_agent.py; leaving the add-on where it is"
+            exit 0
+          fi
+          sed -i -E "s/^version: \"[^\"]*\"/version: \"${VER}\"/" "$cfg"
+          if git diff --quiet; then
+            echo "add-on already at ${VER}"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "$cfg"
+          git commit -m "chore: point the Home Assistant add-on at v${VER} [version bump]"
+          git pull --rebase origin main
+          git push origin HEAD:main

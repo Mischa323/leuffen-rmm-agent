@@ -1,0 +1,13 @@
+configuration:
+  server_url:
+    name: Server address
+    description: Your Leuffen RMM, for example rmm.example.com.
+  enrolment_key:
+    name: Enrolment key
+    description: The one-time key from the RMM's Downloads page (Home Assistant OS).
+  insecure_tls:
+    name: Accept a self-signed certificate
+    description: Turn on when your RMM uses the certificate it generated itself.
+  server_fingerprint:
+    name: Certificate fingerprint
+    description: Optional. When set, only this exact certificate is accepted (SHA-256, from Settings → Security in the RMM).

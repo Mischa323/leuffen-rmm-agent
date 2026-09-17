@@ -447,11 +447,23 @@ def _write_uid_file() -> None:
 # Agent
 # --------------------------------------------------------------------------- #
 class Agent:
-    def __init__(self, cfg: dict):
+    """The protocol side of the slim agent, independent of the appliance.
+
+    What differs between appliances -- how inventory and metrics are gathered,
+    how the box is rebooted, where updates come from -- is passed in. The
+    defaults are Synology DSM; ``haos_agent`` supplies Home Assistant OS.
+    """
+
+    def __init__(self, cfg: dict, inventory=syno_inventory, power=None,
+                 update_message: str = "Synology agent updates are managed via Package Center"):
         self.cfg = cfg
         self.id = _device_id()
         self.ws: WSClient | None = None
         self._pool = ThreadPoolExecutor(max_workers=4)
+        self.inventory = inventory
+        self.hostname = socket.gethostname()
+        self.power = power or _power
+        self.update_message = update_message
 
     def run_forever(self) -> None:
         url = _ws_url(self.cfg["server_url"], self.cfg["api_key"])
@@ -473,7 +485,7 @@ class Agent:
         self.ws = ws
         self._register()
         _set_status(state="connected", detail="", last_connect=time.time())
-        log.info("registered as %s (%s)", socket.gethostname(), self.id)
+        log.info("registered as %s (%s)", self.hostname, self.id)
         stop = threading.Event()
         hb = threading.Thread(target=self._heartbeat, args=(stop,), daemon=True)
         hb.start()
@@ -492,10 +504,10 @@ class Agent:
             ws.close()
 
     def _heartbeat(self, stop: threading.Event) -> None:
-        syno_inventory._cpu_percent()  # prime the delta
+        self.inventory.prime()  # prime the CPU delta
         while not stop.wait(self.cfg["interval"]):
             try:
-                self._send({"type": "metrics", "metrics": syno_inventory.metrics()})
+                self._send({"type": "metrics", "metrics": self.inventory.metrics()})
             except Exception:
                 return
 
@@ -503,7 +515,10 @@ class Agent:
         self.ws.send(json.dumps(msg))
 
     def _register(self) -> None:
-        inv = syno_inventory.collect()
+        inv = self.inventory.collect()
+        # In a container the process's own hostname is the container id; log
+        # the name the device is actually registered under.
+        self.hostname = inv["hostname"]
         self._send({"type": "register", "id": self.id, "hostname": inv["hostname"],
                     "inventory": inv, "supports_secret": True,
                     "device_secret": _load_device_secret()})
@@ -536,7 +551,7 @@ class Agent:
         elif t == "shell_input":
             self._pool.submit(self._shell_input, msg)
         elif t == "power":
-            self._submit(rid, lambda: _power(msg.get("action", "")))
+            self._submit(rid, lambda: self.power(msg.get("action", "")))
         elif t == "file_get":
             self._submit(rid, lambda: handlers.file_get(msg.get("path", "")))
         elif t == "file_put":
@@ -550,11 +565,12 @@ class Agent:
         elif t == "file_mkdir":
             self._submit(rid, lambda: handlers.file_mkdir(msg.get("path", "")))
         elif t == "software_list":
-            self._submit(rid, lambda: {"ok": True, "software": syno_inventory.installed_software()})
+            self._submit(rid, lambda: {"ok": True,
+                                       "software": self.inventory.installed_software()})
         elif t == "update_agent":
-            self._ack(rid, {"ok": False,
-                            "error": "Synology agent updates are managed via Package Center"})
-        # set_role / agent_policy / snmp_* / screen_* / scan: not applicable to a NAS.
+            self._ack(rid, {"ok": False, "error": self.update_message})
+        # set_role / agent_policy / snmp_* / screen_* / scan: not applicable to
+        # an appliance.
 
     def _shell_input(self, msg: dict) -> None:
         res = _run_command(msg.get("data", ""))

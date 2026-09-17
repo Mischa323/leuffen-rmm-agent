@@ -211,6 +211,11 @@ def _cpu_percent() -> float:
     return round((1 - di / dt) * 100, 1)
 
 
+def prime() -> None:
+    """Take the first CPU sample so the next metrics() reports a real delta."""
+    _cpu_percent()
+
+
 def _uptime() -> float:
     try:
         return float(_read("/proc/uptime").split()[0])

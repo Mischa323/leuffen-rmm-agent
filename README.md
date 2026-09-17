@@ -14,6 +14,36 @@ Synology package: `packaging/synology/` holds the `INFO`/scripts/`conf`, and the
 RMM server assembles the `.spk` on demand and serves it through a Package Center
 *package source* (no separate release/CI step).
 
+## Home Assistant OS
+
+This repository is also a **Home Assistant add-on repository**
+(`repository.yaml`, add-on in `homeassistant/leuffen_rmm/`). In Home Assistant:
+**Settings → Add-ons → Add-on store → ⋮ → Repositories**, add
+`https://github.com/Mischa323/leuffen-rmm-agent`, install **Leuffen RMM Agent**,
+then paste the server address and enrolment key shown under **Downloads → Home
+Assistant OS** in the dashboard.
+
+`agent/haos_agent.py` + `agent/haos_inventory.py` run the Synology agent's loop
+(`syno_agent.Agent`) with an inventory that reads the **Supervisor API**: host,
+OS, Core and add-on state, pending updates (reported as `updates_available`),
+and Core + every add-on as `services`. Reboot and shutdown go through the
+Supervisor too. Files and the terminal work inside the add-on container, where
+the Home Assistant configuration is mounted at `/homeassistant`. Remote desktop
+isn't supported.
+
+The add-on is built on the Home Assistant box and downloads those agent files
+from the release tag named by `version` in `config.yaml`. That line must
+therefore point at a **published** tag. `windows-agent-msi.yml` updates it after
+each release, and that change is also what makes Home Assistant offer the update.
+To build it locally the same way:
+
+```sh
+docker build --build-arg BUILD_FROM=ghcr.io/home-assistant/amd64-base:3.22 \
+  --build-arg BUILD_VERSION=<released version> homeassistant/leuffen_rmm
+```
+
+To build unreleased code, add `--build-arg AGENT_SRC=<url serving the agent/ files>`.
+
 ## Desktop console
 
 `console/` is the **technician-side** Windows app: remote control, terminal and

@@ -1,0 +1,42 @@
+# Leuffen RMM agent as a Home Assistant add-on.
+#
+# `version` must always name a PUBLISHED agent release: the Dockerfile fetches
+# the agent from the `v<version>` tag, which exists only once the agent MSI
+# workflow has published it. That workflow moves this line forward itself.
+name: Leuffen RMM Agent
+version: "2.2.43"
+slug: leuffen_rmm
+description: Monitor and manage this Home Assistant server from Leuffen RMM
+url: https://github.com/Mischa323/leuffen-rmm-agent
+arch:
+  - aarch64
+  - amd64
+  - armv7
+init: false
+startup: services
+boot: auto
+# Host networking: real interface addresses and host-wide traffic counters.
+host_network: true
+# Supervisor API: versions, pending updates, add-ons, disk, reboot/shutdown.
+hassio_api: true
+hassio_role: manager
+# Core API (proxied by the Supervisor): is Home Assistant itself running?
+homeassistant_api: true
+# What the RMM's file browser can reach. The configuration is writable so a
+# technician can fix a broken configuration.yaml; backups are read-only.
+map:
+  - type: homeassistant_config
+    read_only: false
+  - type: share
+    read_only: false
+  - type: backup
+    read_only: true
+options:
+  server_url: ""
+  enrolment_key: ""
+  insecure_tls: false
+schema:
+  server_url: str
+  enrolment_key: password
+  insecure_tls: bool
+  server_fingerprint: str?

@@ -1,0 +1,8 @@
+# Home Assistant add-on repository.
+#
+# Add https://github.com/Mischa323/leuffen-rmm-agent in Home Assistant under
+# Settings -> Add-ons -> Add-on store -> (menu) Repositories. The add-on itself
+# lives in homeassistant/leuffen_rmm/.
+name: Leuffen RMM
+url: https://github.com/Mischa323/leuffen-rmm-agent
+maintainer: Leuffen IT
