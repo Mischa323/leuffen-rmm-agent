@@ -37,9 +37,54 @@ ACCENTS = ["#3b82f6", "#6366f1", "#8b5cf6", "#06b6d4",
 C: dict[str, str] = {}          # the live palette, filled by `apply()`
 
 
+_FONTS_REGISTERED = False
+
+
+def _fonts_dir() -> str:
+    """Where the bundled brand fonts live: next to the frozen app, or in a
+    `fonts/` folder beside this file for a checkout that has fetched them."""
+    import os
+    import sys
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, "fonts")
+
+
+def register_bundled_fonts() -> list[str]:
+    """Make the dashboard's own typefaces available to this process only.
+
+    The web UI is set in Onest and JetBrains Mono; a technician's machine has
+    neither, so the console used to fall back to Segoe UI and looked like a
+    different product. The installer ships the font files, and registering
+    them with FR_PRIVATE lets Tk use them without installing anything
+    system-wide -- they vanish again when the console exits.
+    """
+    global _FONTS_REGISTERED
+    if _FONTS_REGISTERED:
+        return []
+    _FONTS_REGISTERED = True
+    import os
+    folder = _fonts_dir()
+    if os.name != "nt" or not os.path.isdir(folder):
+        return []
+    import ctypes
+    fr_private = 0x10
+    loaded = []
+    for name in sorted(os.listdir(folder)):
+        if not name.lower().endswith((".ttf", ".otf")):
+            continue
+        try:
+            if ctypes.windll.gdi32.AddFontResourceExW(os.path.join(folder, name),
+                                                      fr_private, 0):
+                loaded.append(name)
+        except OSError:
+            continue
+    return loaded
+
+
 def _pick_font(root: tk.Misc, *candidates: str) -> str:
-    """First installed family of `candidates` (the brand fonts are web fonts, so
-    on a technician's machine we usually land on the platform default)."""
+    """First available family of `candidates`. With the bundled fonts
+    registered that is the brand face; a checkout without them falls back to
+    the platform default."""
     have = {f.lower() for f in tkfont.families(root)}
     for name in candidates:
         if name.lower() in have:
@@ -80,6 +125,7 @@ def apply(root: tk.Misc, theme: str = "dark", accent: str = "#3b82f6") -> None:
     C["warn_soft"] = mix(C["warn"], C["surface"], 15)
     C["theme"] = theme
 
+    register_bundled_fonts()      # before Tk is asked which families exist
     ui = _pick_font(root, "Onest", "Segoe UI Variable Text", "Segoe UI")
     mono = _pick_font(root, "JetBrains Mono", "Cascadia Mono", "Consolas")
     Fonts.ui = (ui, 10)

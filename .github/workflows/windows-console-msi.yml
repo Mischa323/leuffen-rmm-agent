@@ -51,6 +51,28 @@ jobs:
       - name: Generate app icon
         run: python packaging/windows/make_icon.py
 
+      - name: Fetch the brand fonts
+        # The dashboard is set in Onest and JetBrains Mono. Bundling them (both
+        # SIL Open Font License, licence texts shipped alongside) lets the
+        # console register them for itself and look like the same product.
+        # Fetched at build time so no binaries are committed.
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dest = 'console\fonts'
+          New-Item -ItemType Directory -Force $dest | Out-Null
+          $gf = 'https://raw.githubusercontent.com/google/fonts/main/ofl/onest'
+          Invoke-WebRequest -Uri "$gf/Onest%5Bwght%5D.ttf" -OutFile "$dest\Onest.ttf"
+          Invoke-WebRequest -Uri "$gf/OFL.txt" -OutFile "$dest\Onest-OFL.txt"
+          $zip = Join-Path $env:RUNNER_TEMP 'jbm.zip'
+          Invoke-WebRequest -Uri 'https://github.com/JetBrains/JetBrainsMono/releases/download/v2.304/JetBrainsMono-2.304.zip' -OutFile $zip
+          $x = Join-Path $env:RUNNER_TEMP 'jbm'
+          Expand-Archive -Path $zip -DestinationPath $x -Force
+          Copy-Item "$x\fonts\ttf\JetBrainsMono-Regular.ttf" $dest
+          Copy-Item "$x\fonts\ttf\JetBrainsMono-Medium.ttf" $dest
+          Copy-Item "$x\OFL.txt" "$dest\JetBrainsMono-OFL.txt"
+          Get-ChildItem $dest | ForEach-Object { Write-Host "bundled $($_.Name) ($($_.Length) bytes)" }
+
       - name: Build console exe
         # --onedir for the same Defender reason as the agent. `--collect-all av`
         # bundles PyAV's ffmpeg DLLs (H.264 decode); without them the console
@@ -60,6 +82,7 @@ jobs:
           --name leuffen-rmm-console --paths console --collect-all av
           --hidden-import PIL.Image --hidden-import PIL.ImageTk
           --add-data "packaging\windows\leuffen.ico;."
+          --add-data "console\fonts;fonts"
           console\main.py
 
       - name: Prepare signing certificate
@@ -113,3 +136,7 @@ jobs:
           name: Leuffen RMM Console ${{ steps.ver.outputs.msi }}
           files: leuffen-rmm-console.msi
           fail_on_unmatched_files: true
+          # Never claim "Latest": servers older than the asset-name resolver
+          # fetch the AGENT from releases/latest, and a console release there
+          # turns every agent download and auto-update into a 404.
+          make_latest: "false"

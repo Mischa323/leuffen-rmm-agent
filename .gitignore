@@ -19,3 +19,6 @@ agent/rmm_device_id
 agent/status.json
 agent/sync_request
 agent/agent.log*
+
+# Brand fonts fetched by the console build
+console/fonts/
