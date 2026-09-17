@@ -54,6 +54,11 @@ import screen_h264
 # Input coordinates are scaled back up so control stays pixel-accurate.
 _MAX_EDGE = 1600
 
+# A downscale that only shaves a few percent off (a 2560 screen against a 2400
+# cap) is not worth doing for JPEG: PIL's resample costs ~24 ms per frame there
+# while encoding the full frame costs ~5 ms, and the extra bytes are marginal.
+_JPEG_SKIP_RESIZE_ABOVE = 0.9
+
 # Magic header marking a clipboard payload on the (otherwise JPEG) frame stream.
 # JPEG always starts with FF D8 FF, so there's no collision with a real frame.
 _CLIP_MAGIC = b"LRMMCLIP"
@@ -667,27 +672,40 @@ def _capture_loop(s, fps: int, quality: int, stop: threading.Event,
                     sct = mss.mss()
                 mon = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
                 shot = sct.grab(mon)
-                img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
-                nw, nh = img.width, img.height
+                nw, nh = shot.width, shot.height
                 scale = 1.0
                 if max(nw, nh) > max_edge:
                     scale = max_edge / float(max(nw, nh))
-                    img = img.resize((max(1, int(nw * scale)), max(1, int(nh * scale))),
-                                     Image.BILINEAR)
+                if codec == "h264":
+                    # Straight from the grab: swscale converts and scales in one
+                    # pass (see H264Encoder.encode_bgra). No PIL image at all.
+                    out_w = max(2, int(nw * scale))
+                    out_h = max(2, int(nh * scale))
+                    if enc is None or enc_size != (out_w, out_h):
+                        import screen_h264
+                        enc = screen_h264.H264Encoder(out_w, out_h, fps, quality)
+                        enc_size = (out_w, out_h)
+                    payloads = enc.encode_bgra(shot.bgra, nw, nh)
+                    # The encoder rounds to even dimensions; report and map input
+                    # against what it actually sends.
+                    frame_w, frame_h = enc.width, enc.height
+                    if scale < 1.0:
+                        scale = enc.width / float(nw)
+                else:
+                    if scale >= _JPEG_SKIP_RESIZE_ABOVE:
+                        scale = 1.0
+                    img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+                    if scale < 1.0:
+                        img = img.resize((max(1, int(nw * scale)), max(1, int(nh * scale))),
+                                         Image.BILINEAR, reducing_gap=2.0)
+                    buf = io.BytesIO()
+                    img.save(buf, format="JPEG", quality=quality)
+                    payloads = [buf.getvalue()]
+                    frame_w, frame_h = img.width, img.height
                 if geom is not None:
                     geom["left"] = mon.get("left", 0)
                     geom["top"] = mon.get("top", 0)
                     geom["scale"] = scale
-                if codec == "h264":
-                    if enc is None or enc_size != (img.width, img.height):
-                        import screen_h264
-                        enc = screen_h264.H264Encoder(img.width, img.height, fps, quality)
-                        enc_size = (img.width, img.height)
-                    payloads = enc.encode(img)
-                else:
-                    buf = io.BytesIO()
-                    img.save(buf, format="JPEG", quality=quality)
-                    payloads = [buf.getvalue()]
             except Exception as exc:
                 # Transient (desktop switch, resolution change, secure-desktop
                 # BitBlt). Log sparsely, rebuild the grabber, and keep going.
@@ -724,7 +742,7 @@ def _capture_loop(s, fps: int, quality: int, stop: threading.Event,
             hb_bytes += _nbytes
             _now2 = time.monotonic()
             if frames == 1:
-                _hlog(f"first frame sent ({img.width}x{img.height} @scale {scale:.2f}, "
+                _hlog(f"first frame sent ({frame_w}x{frame_h} @scale {scale:.2f}, "
                       f"codec={codec}, {_nbytes} bytes)")
                 hb_last = _now2
             elif _now2 - hb_last >= 10.0:
@@ -734,7 +752,7 @@ def _capture_loop(s, fps: int, quality: int, stop: threading.Event,
                 _dt = _now2 - hb_last
                 _hlog(f"streaming: {frames} total, {hb_frames / _dt:.1f} fps, "
                       f"{hb_bytes / 1024 / _dt:.0f} KB/s, codec={codec}, "
-                      f"last {img.width}x{img.height}")
+                      f"last {frame_w}x{frame_h}")
                 hb_frames = 0
                 hb_bytes = 0
                 hb_last = _now2
