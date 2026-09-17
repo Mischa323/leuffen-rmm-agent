@@ -60,11 +60,42 @@ def _data_dir() -> str:
     return HERE
 
 
+_MACHINE_ENV_KEY = r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"
+
+
+def _machine_env(name: str) -> str | None:
+    """A machine-level environment variable, read straight from the registry.
+
+    The MSI stores the server URL and key as machine environment variables, but
+    this process usually cannot see them in `os.environ`: it is started by the
+    Task Scheduler service, which hands every task the environment it itself
+    loaded at boot. Right after an install -- or after an upgrade that rewrites
+    them -- the values are in the registry and nowhere else until the next
+    reboot. `os.environ` is also a snapshot, so re-reading it can never pick
+    them up; the registry is where Windows keeps them, and it is current.
+    """
+    if os.name != "nt":
+        return None
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _MACHINE_ENV_KEY) as key:
+            value, _kind = winreg.QueryValueEx(key, name)
+    except OSError:
+        return None
+    value = str(value).strip() if value is not None else ""
+    return value or None
+
+
+def _env(name: str) -> str | None:
+    """This process's environment first, then the machine's current one."""
+    return os.environ.get(name) or _machine_env(name)
+
+
 def _load_config() -> dict:
     """Config precedence: env vars > bundled rmm_config.json."""
-    cfg = {"server_url": os.environ.get("RMM_SERVER_URL"),
-           "api_key": os.environ.get("RMM_API_KEY"),
-           "fingerprint": os.environ.get("RMM_SERVER_FINGERPRINT")}
+    cfg = {"server_url": _env("RMM_SERVER_URL"),
+           "api_key": _env("RMM_API_KEY"),
+           "fingerprint": _env("RMM_SERVER_FINGERPRINT")}
     path = os.path.join(_data_dir(), "rmm_config.json")
     if os.path.exists(path):
         try:
@@ -78,7 +109,7 @@ def _load_config() -> dict:
             pass
     cfg["interval"] = float(os.environ.get("RMM_INTERVAL", "30"))
     # Env overrides file. Used to accept the server's self-signed certificate.
-    env_insecure = os.environ.get("RMM_INSECURE_TLS")
+    env_insecure = _env("RMM_INSECURE_TLS")
     if env_insecure is not None:
         cfg["insecure_tls"] = env_insecure.lower() in ("1", "true", "yes")
     cfg["insecure_tls"] = bool(cfg.get("insecure_tls", False))
@@ -1132,11 +1163,12 @@ def main() -> None:
         sys.exit(0)
     cfg = _load_config()
     if not (cfg.get("server_url") and cfg.get("api_key")):
-        # Config can be momentarily absent right after an MSI self-update: the
-        # installer re-sets the server URL/key as machine env vars, but those don't
-        # always reach the relaunched task immediately (and the persistent
-        # %ProgramData% copy may still be landing). Wait for it to appear instead of
-        # crash-looping offline; give up only after the upgrade window elapses.
+        # Config can be momentarily absent right after an install or an MSI
+        # self-update: the installer may still be writing the machine
+        # environment, or the persistent %ProgramData% copy. _load_config reads
+        # the machine environment from the registry, so polling here does pick
+        # the values up the moment they land (re-reading os.environ never
+        # could). Give up only after the install window elapses.
         deadline = time.time() + 120
         while not (cfg.get("server_url") and cfg.get("api_key")):
             if time.time() >= deadline:

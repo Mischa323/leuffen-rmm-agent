@@ -101,7 +101,9 @@
     <InstallExecuteSequence>
       <Custom Action="AddDefenderExclusion" Before="InstallFiles" Condition="NOT Installed" />
       <Custom Action="CreateTask" After="InstallFiles" Condition="NOT Installed" />
-      <Custom Action="StartTask" After="CreateTask" Condition="NOT Installed" />
+      <!-- Start only once the server URL and key have been written: the environment
+           strings land at WriteEnvironmentStrings, well after InstallFiles. -->
+      <Custom Action="StartTask" After="WriteEnvironmentStrings" Condition="NOT Installed" />
       <Custom Action="DeleteTask" Before="RemoveFiles" Condition="REMOVE=&quot;ALL&quot;" />
       <Custom Action="RemoveDefenderExclusion" After="DeleteTask" Condition="REMOVE=&quot;ALL&quot;" />
       <Custom Action="LaunchConfig" After="InstallFinalize" Condition="NOT Installed AND UILevel &gt; 3" />
