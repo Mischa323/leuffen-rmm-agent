@@ -22,8 +22,13 @@ frames back to the agent over a loopback TCP socket and receives input events th
 same way. On Linux (or when already interactive) the agent captures directly.
 
 Frames whose longest edge exceeds ``max_edge`` (sent by the viewer's speed
-preset) are downscaled before JPEG to keep the stream fast; injected mouse
+preset) are downscaled before encoding to keep the stream fast; injected mouse
 coordinates are scaled back to native pixels so clicks still land right.
+
+Inside the helper, grabbing, encoding and sending run as three parallel
+stages on an absolute clock (see :func:`_capture_loop`), because doing them
+one after another inside a single display refresh made the frame rate jump
+between whole divisors of the refresh rate.
 
 Clipboard text syncs both ways: ``clip_paste`` sets the remote clipboard and
 sends Ctrl+V; ``clip_get`` reads the remote clipboard and ships it back to the
@@ -42,10 +47,12 @@ import io
 import json
 import os
 import platform
+import queue
 import socket
 import subprocess
 import sys
 import threading
+import time
 
 import screen_h264
 
@@ -379,7 +386,9 @@ class ScreenSession:
         # 'control' = interactive remote session (shows the consent banner);
         # 'screenshot' = one-shot still grabbed by the dashboard (no banner).
         self.purpose = purpose or "control"
-        self.fps = max(1, min(fps, 24))
+        # 32, not 30: a display running a hair fast (or a viewer asking for
+        # headroom) should not be clamped down to half its refresh rate.
+        self.fps = max(1, min(fps, 32))
         self.quality = max(10, min(quality, 90))
         try:
             self.max_edge = max(320, min(int(max_edge or _MAX_EDGE), 4096))
@@ -567,8 +576,8 @@ class ScreenSession:
         try:
             with mss.mss() as sct:
                 monitor = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
+                deadline = time.monotonic()
                 while True:
-                    t0 = time.monotonic()
                     shot = sct.grab(monitor)
                     img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
                     if self.codec == "h264":
@@ -580,7 +589,12 @@ class ScreenSession:
                         buf = io.BytesIO()
                         img.save(buf, format="JPEG", quality=self.quality)
                         await self.send_bytes(buf.getvalue())
-                    await asyncio.sleep(max(0.0, interval - (time.monotonic() - t0)))
+                    # Absolute clock, so one slow frame doesn't push the rest late.
+                    deadline += interval
+                    now = time.monotonic()
+                    if deadline < now - interval:
+                        deadline = now
+                    await asyncio.sleep(max(0.0, deadline - now))
         except asyncio.CancelledError:
             pass
         except Exception as exc:
@@ -622,39 +636,82 @@ class ScreenSession:
 # --------------------------------------------------------------------------- #
 # Helper process (runs in the interactive/console session).
 # --------------------------------------------------------------------------- #
-def _capture_loop(s, fps: int, quality: int, stop: threading.Event,
-                  geom: dict | None = None, send_lock: threading.Lock | None = None,
-                  max_edge: int = _MAX_EDGE, codec: str = "jpeg") -> None:
-    """Grab the screen and stream frames until ``stop`` is set or the socket
-    drops. ``codec`` is 'jpeg' (full frames) or 'h264' (Annex-B, delta-encoded).
-    On Windows it follows the active input desktop so it keeps working across the
-    secure-desktop switch, downscales big frames, and survives the odd BitBlt
-    failure (e.g. mid secure-desktop switch) instead of ending."""
-    is_win = platform.system() == "Windows"
-    cap_state: dict = {}
-    sct = None
-    frames = 0
-    fails = 0
-    reason = "stopped"
-    enc = None          # lazily-created H.264 encoder (recreated on size change)
-    enc_size = None
-    hb_frames = 0       # frames/bytes since the last heartbeat log
-    hb_bytes = 0
-    hb_last = 0.0
+# Rates the pacer steps through when a device or link cannot hold the one the
+# viewer asked for, and climbs back up when it can. Steady beats fast: a stream
+# sitting on 24 looks far better than one flipping between 30 and 15.
+_RATE_STEPS = (32, 30, 24, 20, 15, 12, 10, 8, 5, 3, 2, 1)
 
-    def _send(data: bytes) -> bool:
-        if send_lock is not None:
-            with send_lock:
-                return _send_msg(s, data)
-        return _send_msg(s, data)
 
-    try:
-        import time
+def _raw_pixels(shot):
+    """The BGRA bytes of a grab without the extra whole-frame copy that
+    ``.bgra`` makes (1.4 ms on a 2256x1504 screen). ``raw`` is a fresh bytearray
+    per grab, so handing it to another thread is safe."""
+    raw = getattr(shot, "raw", None)
+    return shot.bgra if raw is None else raw
+
+
+class _FrameSource:
+    """Grabs the screen on its own thread and keeps only the newest frame.
+
+    A grab blocks until the display's next vertical blank, so a loop that grabs
+    *and then* encodes pays both costs inside one refresh period. The moment the
+    pair crosses that period, the next grab has to wait for the period after it
+    and the frame rate halves -- measured on a 32 Hz panel, 15 ms of extra encode
+    work took the stream from 32 fps to exactly 16. That is the jumping frame
+    rate: the stream lands on whole divisors of the refresh rate and flips
+    between them as the encode cost drifts across the boundary. Grabbing here,
+    while the encoder works on the previous frame, makes the rate follow the
+    slower stage instead of the sum of both (32 fps with that same extra work).
+    """
+
+    def __init__(self, stop: threading.Event, interval) -> None:
+        self._stop = stop
+        self._interval = interval       # callable -> the current tick, in seconds
+        self._cond = threading.Condition()
+        self._frame = None              # (pixels, width, height, left, top)
+        self._seq = 0
+        self._taken = True
+        self.grabs = 0
+        self.error: str | None = None
+        self._thread = threading.Thread(target=self._run, name="rmm-screen-grab",
+                                        daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def latest(self, seen: int, timeout: float):
+        """The newest frame and its sequence number, waiting up to ``timeout``
+        for one newer than ``seen``. Hands back the frame it already gave (same
+        sequence number) rather than nothing, so the caller can hold its cadence
+        through a display that had nothing new to offer."""
+        deadline = time.monotonic() + timeout
+        with self._cond:
+            while self._seq == seen and not self._stop.is_set():
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                self._cond.wait(left)
+            self._taken = True
+            self._cond.notify_all()
+            return self._frame, self._seq
+
+    def _run(self) -> None:
         import mss
-        from PIL import Image
-        interval = 1.0 / fps
-        while not stop.is_set():
-            t0 = time.monotonic()
+        is_win = platform.system() == "Windows"
+        cap_state: dict = {}
+        sct = None
+        fails = 0
+        nxt = time.monotonic()
+        while not self._stop.is_set():
+            # The encoder still hasn't taken the last frame: another grab would
+            # only overwrite it, and a grab is the most expensive thing this
+            # process does. Wait for it to be picked up instead.
+            with self._cond:
+                while (self._frame is not None and not self._taken
+                       and not self._stop.is_set()):
+                    self._cond.wait(0.1)
+            if self._stop.is_set():
+                break
             try:
                 if is_win:
                     # Follow the active input desktop (Default / Winlogon). On a
@@ -672,40 +729,6 @@ def _capture_loop(s, fps: int, quality: int, stop: threading.Event,
                     sct = mss.mss()
                 mon = sct.monitors[1] if len(sct.monitors) > 1 else sct.monitors[0]
                 shot = sct.grab(mon)
-                nw, nh = shot.width, shot.height
-                scale = 1.0
-                if max(nw, nh) > max_edge:
-                    scale = max_edge / float(max(nw, nh))
-                if codec == "h264":
-                    # Straight from the grab: swscale converts and scales in one
-                    # pass (see H264Encoder.encode_bgra). No PIL image at all.
-                    out_w = max(2, int(nw * scale))
-                    out_h = max(2, int(nh * scale))
-                    if enc is None or enc_size != (out_w, out_h):
-                        import screen_h264
-                        enc = screen_h264.H264Encoder(out_w, out_h, fps, quality)
-                        enc_size = (out_w, out_h)
-                    payloads = enc.encode_bgra(shot.bgra, nw, nh)
-                    # The encoder rounds to even dimensions; report and map input
-                    # against what it actually sends.
-                    frame_w, frame_h = enc.width, enc.height
-                    if scale < 1.0:
-                        scale = enc.width / float(nw)
-                else:
-                    if scale >= _JPEG_SKIP_RESIZE_ABOVE:
-                        scale = 1.0
-                    img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
-                    if scale < 1.0:
-                        img = img.resize((max(1, int(nw * scale)), max(1, int(nh * scale))),
-                                         Image.BILINEAR, reducing_gap=2.0)
-                    buf = io.BytesIO()
-                    img.save(buf, format="JPEG", quality=quality)
-                    payloads = [buf.getvalue()]
-                    frame_w, frame_h = img.width, img.height
-                if geom is not None:
-                    geom["left"] = mon.get("left", 0)
-                    geom["top"] = mon.get("top", 0)
-                    geom["scale"] = scale
             except Exception as exc:
                 # Transient (desktop switch, resolution change, secure-desktop
                 # BitBlt). Log sparsely, rebuild the grabber, and keep going.
@@ -719,58 +742,359 @@ def _capture_loop(s, fps: int, quality: int, stop: threading.Event,
                         pass
                 sct = None
                 if fails > 200:
-                    reason = f"giving up after {fails} grab errors: {exc!r}"
+                    self.error = f"giving up after {fails} grab errors: {exc!r}"
                     break
-                time.sleep(0.2)
+                self._stop.wait(0.2)
                 continue
             fails = 0
-            closed = False
-            for _data in payloads:
-                if not _send(_data):
-                    closed = True
-                    break
-            if closed:
-                reason = "viewer/socket closed"
+            self.grabs += 1
+            with self._cond:
+                self._frame = (_raw_pixels(shot), shot.width, shot.height,
+                               mon.get("left", 0), mon.get("top", 0))
+                self._seq += 1
+                self._taken = False
+                self._cond.notify_all()
+            # Pace the grabs too, a shade ahead of the tick so a fresh frame is
+            # usually waiting when the encoder wants one. Grabbing flat out would
+            # spend a core on frames nobody encodes.
+            nxt += self._interval() * 0.85
+            now = time.monotonic()
+            if nxt <= now:
+                nxt = now           # fell behind: carry on, don't burst
+            else:
+                self._stop.wait(nxt - now)
+        if sct is not None:
+            try:
+                sct.close()
+            except Exception:
+                pass
+        with self._cond:            # wake a caller waiting on a frame that won't come
+            self._cond.notify_all()
+
+
+class _Sender:
+    """Ships encoded frames to the agent on its own thread.
+
+    Writing to the socket from the encode loop meant a busy link pushed the next
+    frame late, which is the jitter this pipeline exists to avoid. Frames are
+    queued in order -- H.264 deltas can be neither reordered nor dropped -- and
+    the queue is deliberately short, so a link that cannot keep up shows up as
+    backpressure, which the pacer answers by lowering the rate.
+    """
+
+    # Two frames: enough to ride out one slow write, short enough that a link
+    # which cannot keep up starts pushing back within ~60 ms instead of building
+    # up a backlog of video the viewer would watch late.
+    DEPTH = 2
+
+    def __init__(self, sock, lock, stop: threading.Event) -> None:
+        self._sock = sock
+        self._lock = lock
+        self._stop = stop
+        self._q: queue.Queue = queue.Queue(maxsize=self.DEPTH)
+        self.closed = False
+        self._thread = threading.Thread(target=self._run, name="rmm-screen-send",
+                                        daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def put(self, payloads) -> float:
+        """Queue one frame's payloads. Returns the seconds spent waiting for
+        room; the pacer counts that as part of what the frame cost."""
+        t0 = time.monotonic()
+        while not self._stop.is_set() and not self.closed:
+            try:
+                self._q.put(payloads, timeout=0.25)
                 break
-            if not payloads:
-                # Encoder is buffering (no output for this frame yet).
-                time.sleep(max(0.0, interval - (time.monotonic() - t0)))
+            except queue.Full:
                 continue
-            frames += 1
-            _nbytes = sum(len(p) for p in payloads)
-            hb_frames += 1
-            hb_bytes += _nbytes
-            _now2 = time.monotonic()
+        return time.monotonic() - t0
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                item = self._q.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            for payload in item:
+                if self._lock is not None:
+                    with self._lock:
+                        ok = _send_msg(self._sock, payload)
+                else:
+                    ok = _send_msg(self._sock, payload)
+                if not ok:
+                    self.closed = True
+                    self._stop.set()
+                    return
+
+
+class _Pacer:
+    """Keeps the frame rate on one number.
+
+    The viewer asks for a rate, but whether a device can hold it depends on the
+    screen, the encoder and the link -- none of which are known up front, and the
+    link changes under us. So watch what a frame actually costs (encode, plus any
+    wait for the socket) and step the rate down when that stops fitting in a
+    tick, back up when it fits again with room to spare. The asymmetry is
+    deliberate: quick to back off, slow to climb, so the rate settles instead of
+    oscillating -- oscillation being the thing we are getting rid of.
+
+    A rate that has already failed gets a growing cooling-off period before it is
+    tried again. When the *link* is the limit this matters: at the lower rate
+    nothing is waiting on the socket, so a frame looks cheap and the climb looks
+    safe -- right up until the higher rate saturates the link again. Doubling the
+    wait after each failed attempt turns that into a few brief probes rather than
+    a permanent see-saw.
+    """
+
+    WINDOW = 2.0        # evidence gathered before any change
+    SETTLE = 8.0        # ... and the quiet spell required before climbing back
+    RETRY = 30.0        # first cooling-off for a rate that has failed once
+    MAX_RETRY = 240.0   # ... doubling up to this for one that keeps failing
+
+    # JPEG carries the whole picture every frame, so its bitrate is the frame
+    # rate times a full still: 30 fps of 1600px JPEG measured 22 Mbit/s against
+    # H.264's 2.7. The fallback stays at a rate a normal link can carry.
+    JPEG_CEILING = 20
+
+    def __init__(self, requested: int, codec: str = "h264") -> None:
+        if codec != "h264":
+            requested = min(requested, self.JPEG_CEILING)
+        steps = [r for r in _RATE_STEPS if r <= requested]
+        if not steps or steps[0] != requested:
+            steps.insert(0, requested)
+        self.steps = steps
+        self.requested = requested
+        self.target = requested
+        self.work_ms = 0.0
+        self.achieved = 0.0
+        self._i = 0
+        self._n = 0
+        self._sum = 0.0
+        self._start = time.monotonic()
+        self._primed = False
+        self._bad = 0               # consecutive windows this rate fell short
+        # Skip the first seconds: the encoder's first frames (keyframe, ramp-up)
+        # are not what the steady state costs.
+        self._until = time.monotonic() + 3.0
+        self._changed = 0.0
+        self._retry_at: dict[int, float] = {}   # step -> when it may be tried again
+        self._wait: dict[int, float] = {}       # step -> how long that wait now is
+
+    def interval(self) -> float:
+        return 1.0 / self.target
+
+    def frame(self, work: float, blocked: float) -> None:
+        """Book one delivered frame and, once a window's worth has gone by,
+        decide whether this rate is the right one to be holding."""
+        now = time.monotonic()
+        self._n += 1
+        self._sum += work + blocked
+        if now < self._until or self._n < 8:
+            return
+        span = max(1e-6, now - self._start)
+        achieved = self._n / span
+        mean = self._sum / self._n
+        self.work_ms = mean * 1000
+        self.achieved = achieved
+        self._n = 0
+        self._sum = 0.0
+        self._start = now
+        self._until = now + self.WINDOW
+        if not self._primed:
+            # The first window after a start or a change is the encoder warming
+            # up or the pipeline settling into a new rate -- not evidence.
+            self._primed = True
+            return
+        # Two ways to be over the line: the frames cost more than a tick has to
+        # give (a slow device), or they are simply not coming out at the rate we
+        # asked for (a link that cannot carry them -- where the cost of a frame
+        # says nothing, because the wait lands on whichever frame fills the
+        # socket buffer).
+        short = achieved < self.target * 0.9
+        if not (short or mean > self.interval() * 0.92):
+            self._bad = 0
+        else:
+            self._bad += 1
+        # Two windows, so a passing squall -- a background job on the device, a
+        # blip on the link -- doesn't cost the session its frame rate.
+        if self._bad >= 2 and self._i + 1 < len(self.steps):
+            why = (f"{achieved:.1f} fps delivered of {self.target}" if short else
+                   f"{mean * 1000:.0f} ms a frame does not fit "
+                   f"{self.interval() * 1000:.0f} ms")
+            wait = self._wait.get(self._i, self.RETRY)
+            self._retry_at[self._i] = now + wait
+            self._wait[self._i] = min(wait * 2, self.MAX_RETRY)
+            self._step(self._i + 1, why)
+        elif (self._i > 0 and now - self._changed > self.SETTLE
+                and now >= self._retry_at.get(self._i - 1, 0.0)
+                and achieved >= self.target * 0.97
+                and mean < 0.6 / self.steps[self._i - 1]):
+            self._step(self._i - 1, f"holding {achieved:.1f} fps on "
+                                    f"{mean * 1000:.0f} ms a frame")
+
+    def _step(self, i: int, why: str) -> None:
+        was = self.target
+        self._i = i
+        self._bad = 0
+        self._primed = False        # let the new rate settle before judging it
+        self.target = self.steps[i]
+        self._changed = time.monotonic()
+        _hlog(f"pacing: {was} -> {self.target} fps ({why})")
+
+
+def _capture_loop(s, fps: int, quality: int, stop: threading.Event,
+                  geom: dict | None = None, send_lock: threading.Lock | None = None,
+                  max_edge: int = _MAX_EDGE, codec: str = "jpeg") -> None:
+    """Stream the screen until ``stop`` is set or the socket drops. ``codec`` is
+    'jpeg' (full frames) or 'h264' (Annex-B, delta-encoded).
+
+    Grabbing (:class:`_FrameSource`), encoding (here) and sending
+    (:class:`_Sender`) run in parallel, because chaining them inside one display
+    refresh is what made the frame rate jump between whole divisors of the
+    refresh rate. Each tick encodes the newest grabbed frame on an absolute
+    clock; a tick that finds nothing new re-encodes the last frame, which in
+    H.264 costs a few hundred bytes and keeps the viewer's cadence constant
+    (a repeated JPEG would cost a whole frame for nothing, so those are skipped).
+    """
+    from PIL import Image
+
+    pacer = _Pacer(fps, codec)
+    src = _FrameSource(stop, pacer.interval)
+    sender = _Sender(s, send_lock, stop)
+    enc = None          # lazily-created H.264 encoder (recreated on size change)
+    enc_size = None
+    seen = 0
+    frames = 0
+    enc_fails = 0
+    reason = "stopped"
+    frame_w = frame_h = 0
+    hb_frames = 0       # frames/bytes/repeats since the last heartbeat log
+    hb_bytes = 0
+    hb_dups = 0
+    hb_grabs = 0
+    hb_last = 0.0
+
+    try:
+        src.start()
+        sender.start()
+        deadline = time.monotonic() + pacer.interval()
+        while not stop.is_set():
+            if src.error:
+                # The grabber gave up. Without this the loop would happily go on
+                # re-encoding the last frame, showing the operator a screen that
+                # is frozen rather than a session that ended.
+                reason = src.error
+                break
+            # Wait for a fresh frame only while this tick still has time to
+            # spare -- leaving room for the encode, or the waiting alone would
+            # push every tick late. Past that, serve the tick with the frame
+            # already in hand.
+            slack = deadline - time.monotonic() - max(0.003, pacer.work_ms / 1000.0)
+            frame, seq = src.latest(seen, timeout=max(0.0, slack))
+            if frame is None:
+                stop.wait(0.005)                # nothing grabbed yet
+                continue
+            repeat = seq == seen
+            seen = seq
+            t0 = time.monotonic()
+            raw, nw, nh, left, top = frame
+            scale = 1.0
+            if max(nw, nh) > max_edge:
+                scale = max_edge / float(max(nw, nh))
+            try:
+                if codec == "h264":
+                    # Straight from the grab: swscale converts and scales in one
+                    # pass (see H264Encoder.encode_bgra). No PIL image at all.
+                    out_w = max(2, int(nw * scale))
+                    out_h = max(2, int(nh * scale))
+                    if enc is None or enc_size != (out_w, out_h):
+                        enc = screen_h264.H264Encoder(out_w, out_h, pacer.requested, quality)
+                        enc_size = (out_w, out_h)
+                    payloads = enc.encode_bgra(raw, nw, nh)
+                    # The encoder rounds to even dimensions; report and map input
+                    # against what it actually sends.
+                    frame_w, frame_h = enc.width, enc.height
+                    if scale < 1.0:
+                        scale = enc.width / float(nw)
+                elif repeat:
+                    payloads = []               # see the docstring
+                else:
+                    if scale >= _JPEG_SKIP_RESIZE_ABOVE:
+                        scale = 1.0
+                    img = Image.frombytes("RGB", (nw, nh), bytes(raw), "raw", "BGRX")
+                    if scale < 1.0:
+                        img = img.resize((max(1, int(nw * scale)), max(1, int(nh * scale))),
+                                         Image.BILINEAR, reducing_gap=2.0)
+                    buf = io.BytesIO()
+                    img.save(buf, format="JPEG", quality=quality)
+                    payloads = [buf.getvalue()]
+                    frame_w, frame_h = img.width, img.height
+                enc_fails = 0
+            except Exception as exc:
+                enc_fails += 1
+                if enc_fails == 1 or enc_fails % 50 == 0:
+                    _hlog(f"frame encode error x{enc_fails} (recovering): {exc!r}")
+                if enc_fails > 100:
+                    reason = f"giving up after {enc_fails} encode errors: {exc!r}"
+                    break
+                enc = None                      # rebuild on the next frame
+                payloads = []
+            if geom is not None:
+                geom["left"] = left
+                geom["top"] = top
+                geom["scale"] = scale
+            blocked = 0.0
+            if payloads:
+                blocked = sender.put(payloads)
+                if sender.closed:
+                    reason = "viewer/socket closed"
+                    break
+                frames += 1
+                hb_frames += 1
+                hb_bytes += sum(len(p) for p in payloads)
+                if repeat:
+                    hb_dups += 1
+                # Only frames that were really encoded and shipped say anything
+                # about what this device and link can carry; a skipped JPEG
+                # repeat costs nothing and would flatter the average.
+                pacer.frame(time.monotonic() - t0, blocked)
+            now = time.monotonic()
             if frames == 1:
                 _hlog(f"first frame sent ({frame_w}x{frame_h} @scale {scale:.2f}, "
-                      f"codec={codec}, {_nbytes} bytes)")
-                hb_last = _now2
-            elif _now2 - hb_last >= 10.0:
-                # Time-based heartbeat: shows the real fps/throughput over the last
-                # window, so a stall (fps -> 0) or a healthy stream is visible right
-                # up to the moment a session drops.
-                _dt = _now2 - hb_last
-                _hlog(f"streaming: {frames} total, {hb_frames / _dt:.1f} fps, "
-                      f"{hb_bytes / 1024 / _dt:.0f} KB/s, codec={codec}, "
+                      f"codec={codec}, {hb_bytes} bytes)")
+                hb_last = now
+                hb_grabs = src.grabs
+            elif now - hb_last >= 10.0:
+                # Time-based heartbeat: the real fps/throughput over the last
+                # window, so a stall (fps -> 0) or a healthy stream is visible
+                # right up to the moment a session drops. 'screen' is how often
+                # the display actually had something new; the difference is the
+                # repeats that keep the cadence even.
+                _dt = now - hb_last
+                _hlog(f"streaming: {frames} total, {hb_frames / _dt:.1f} fps "
+                      f"(target {pacer.target}, screen {(src.grabs - hb_grabs) / _dt:.1f}, "
+                      f"{hb_dups} repeats), {hb_bytes / 1024 / _dt:.0f} KB/s, "
+                      f"{pacer.work_ms:.0f} ms/frame, codec={codec}, "
                       f"last {frame_w}x{frame_h}")
-                hb_frames = 0
-                hb_bytes = 0
-                hb_last = _now2
-            # Pace to the target fps but subtract the time already spent grabbing
-            # and encoding, so a slow frame doesn't stack on top of a full
-            # interval (which capped the real rate well below the requested fps).
-            time.sleep(max(0.0, interval - (time.monotonic() - t0)))
+                hb_frames = hb_bytes = hb_dups = 0
+                hb_grabs = src.grabs
+                hb_last = now
+            # Hold the cadence on an absolute clock: sleeping "the rest of the
+            # interval" lets every overrun push the frames after it late, which
+            # is how a steady rate turns into a wandering one.
+            interval = pacer.interval()
+            deadline += interval
+            if deadline < now - interval:
+                deadline = now                  # far behind: resync, don't burst
+            stop.wait(max(0.0, deadline - time.monotonic()))
     except Exception as exc:
         reason = f"error: {exc!r}"
     finally:
         _hlog(f"capture loop ended after {frames} frames ({reason})")
         # Whatever ended the loop, make sure the banner/other threads wind down.
         stop.set()
-        if sct is not None:
-            try:
-                sct.close()
-            except Exception:
-                pass
         try:
             s.close()
         except Exception:
@@ -880,7 +1204,7 @@ def run_screen_helper(argv) -> None:
         i = argv.index("--screen-helper")
         port = int(argv[i + 1])
         token = argv[i + 2]
-        fps = max(1, min(int(argv[i + 3]), 24))
+        fps = max(1, min(int(argv[i + 3]), 32))
         quality = max(10, min(int(argv[i + 4]), 90))
         mode = argv[i + 5] if len(argv) > i + 5 else "user"
         try:

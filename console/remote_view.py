@@ -24,17 +24,19 @@ import video
 import wsbridge
 from theme import C, Button, Fonts
 
-# Speed presets, identical to the web viewer's (the agent clamps fps <= 24,
-# quality <= 90, max_edge <= 4096).
+# Speed presets, identical to the web viewer's. All three ask for 30 fps: the
+# agent paces to it and steps down only where a device or link cannot hold it,
+# so a preset picks how the picture looks, not how smooth it is. (The agent
+# clamps fps <= 32, quality <= 90, max_edge <= 4096.)
 PRESETS = {
-    "balanced": {"fps": 20, "quality": 72, "max_edge": 2400},
-    "sharp": {"fps": 15, "quality": 88, "max_edge": 2880},
-    "smooth": {"fps": 24, "quality": 60, "max_edge": 1920},
+    "balanced": {"fps": 30, "quality": 72, "max_edge": 2400},
+    "sharp": {"fps": 30, "quality": 88, "max_edge": 2880},
+    "smooth": {"fps": 30, "quality": 60, "max_edge": 1920},
 }
 PRESET_LABELS = {
     "balanced": "Balanced - crisp & smooth",
     "sharp": "Sharp - full resolution",
-    "smooth": "Smooth - highest frame rate",
+    "smooth": "Smooth - lightest on a thin link",
 }
 
 MAX_RECONNECT = 8
@@ -66,6 +68,8 @@ MODIFIER_KEYSYMS = {
 
 class RemoteWindow(tk.Toplevel):
     """One remote-control session. Independent window, independent socket."""
+
+    STAT_WINDOW = 3        # seconds averaged into the frames/bandwidth readout
 
     def __init__(self, parent, client, device: dict, settings: dict, on_close=None):
         super().__init__(parent)
@@ -101,6 +105,7 @@ class RemoteWindow(tk.Toplevel):
         # --- session bookkeeping ---
         self._frames = 0
         self._bytes = 0
+        self._history: list[tuple[int, int]] = []   # per-second frames/bytes
         self._user_closed = False
         self._attempts = 0
         self._reconnect_job = None
@@ -605,14 +610,22 @@ class RemoteWindow(tk.Toplevel):
         self.status_label.configure(text=" - ".join(x for x in (message, started) if x))
 
     def _tick_stats(self) -> None:
+        """Frames and bytes over the last three seconds, not the last one: a
+        frame landing either side of a one-second boundary moves a per-second
+        count by a whole frame, so an even 30 fps stream still reads 29/31/30."""
         if not tasks.alive(self):
             return
         if self.session is None:
             self.stats_label.configure(text="-")
+            self._history.clear()
         else:
-            bits = self._bytes * 8
+            self._history.append((self._frames, self._bytes))
+            del self._history[:-self.STAT_WINDOW]
+            secs = len(self._history)
+            fps = sum(f for f, _ in self._history) / secs
+            bits = sum(b for _, b in self._history) * 8 / secs
             rate = (f"{bits / 1e6:.1f} Mbps" if bits >= 1e6 else f"{round(bits / 1e3)} kbps")
             size = f"{self.native_w}x{self.native_h}" if self.native_w else "-"
-            self.stats_label.configure(text=f"{self._frames} fps - {rate} - {size}")
+            self.stats_label.configure(text=f"{round(fps)} fps - {rate} - {size}")
         self._frames = self._bytes = 0
         self.after(1000, self._tick_stats)
