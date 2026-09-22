@@ -4,7 +4,7 @@
 # the agent from the `v<version>` tag, which exists only once the agent MSI
 # workflow has published it. That workflow moves this line forward itself.
 name: Leuffen RMM Agent
-version: "2.2.44"
+version: "2.2.45"
 slug: leuffen_rmm
 description: Monitor and manage this Home Assistant server from Leuffen RMM
 url: https://github.com/Mischa323/leuffen-rmm-agent
