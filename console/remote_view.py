@@ -41,7 +41,9 @@ PRESET_LABELS = {
 
 MAX_RECONNECT = 8
 MOVE_INTERVAL = 0.016          # ~60 pointer updates/second is plenty
-CLIP_PULL_DELAY_MS = 180       # let the remote finish copying before we read it
+# The agent waits for the copy to land (after_copy); the delay is for older
+# agents, which read the clipboard as soon as they are asked.
+CLIP_PULL_DELAY_MS = 300
 # "Paste as keystrokes" limits: chunked so one long message can't stall the
 # input stream, and capped because typing is much slower than a paste.
 KEYSTROKE_CHUNK = 200
@@ -505,7 +507,7 @@ class RemoteWindow(tk.Toplevel):
             if clip_only and base in ("c", "x"):
                 # The remote needs a moment to fill its clipboard; then mirror
                 # it into this computer's.
-                self.after(CLIP_PULL_DELAY_MS, self.copy_from_remote)
+                self.after(CLIP_PULL_DELAY_MS, lambda: self._send({"kind": "clip_get", "after_copy": True}))
             return "break"
         if keysym in KEYMAP and keysym != "space":
             self._send({"kind": "hotkey", "keys": [KEYMAP[keysym]]})
@@ -526,9 +528,13 @@ class RemoteWindow(tk.Toplevel):
 
     # ----------------------------------------------------------- clipboard -- #
     def copy_from_remote(self) -> None:
-        self._send({"kind": "clip_get"})
+        self._send({"kind": "clip_get", "report_empty": True})
 
     def _receive_clipboard(self, text: str) -> None:
+        if not text:
+            # Nothing was copied over there; leave this clipboard as it is.
+            self.btn_copy.flash("Nothing copied")
+            return
         try:
             self.clipboard_clear()
             self.clipboard_append(text)

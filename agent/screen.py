@@ -35,6 +35,13 @@ sends Ctrl+V; ``clip_get`` reads the remote clipboard and ships it back to the
 viewer as a small ``LRMMCLIP``-tagged binary blob (the server already relays
 agent binary to the viewer, so this needs no server change).
 
+Copying out of the remote is Ctrl+C followed by a ``clip_get``. The viewer can
+not know when the application on this side has filled the clipboard, so a
+``clip_get`` with ``after_copy`` waits for Windows' clipboard sequence number to
+move past the one noted when the Ctrl+C was pressed -- instead of reading
+whatever was there before, which is what a fixed delay on the viewer's side
+gave whenever the copy took longer than the guess.
+
 When launched in a user session the helper also shows an always-on-top banner so
 the person at the device clearly sees that a remote session is active and can end
 it themselves with a Disconnect button (which stops capture and tears the session
@@ -144,9 +151,31 @@ def _recv_msg(sock) -> bytes | None:
 # Clipboard (Windows): read/write CF_UNICODETEXT. Handles are kept pointer-wide
 # (c_void_p) so nothing is truncated on 64-bit.
 # --------------------------------------------------------------------------- #
-def _clip_get() -> str | None:
+def _clip_seq() -> int | None:
+    """Windows' clipboard sequence number: it moves whenever anything is copied."""
     if platform.system() != "Windows":
         return None
+    try:
+        import ctypes
+        return int(ctypes.windll.user32.GetClipboardSequenceNumber())
+    except Exception:
+        return None
+
+
+def _clip_get() -> str | None:
+    """The clipboard's text. Right after a copy the application that made it may
+    still hold the clipboard open, so a refusal is tried again for a moment."""
+    for _ in range(12):
+        opened, text = _clip_read_once()
+        if opened:
+            return text
+        time.sleep(0.025)
+    return None
+
+
+def _clip_read_once() -> tuple[bool, str | None]:
+    if platform.system() != "Windows":
+        return True, None
     try:
         import ctypes
         from ctypes import wintypes
@@ -158,22 +187,22 @@ def _clip_get() -> str | None:
         k32.GlobalLock.argtypes = [ctypes.c_void_p]
         k32.GlobalUnlock.argtypes = [ctypes.c_void_p]
         if not u32.OpenClipboard(None):
-            return None
+            return False, None
         try:
             h = u32.GetClipboardData(13)  # CF_UNICODETEXT
             if not h:
-                return None
+                return True, None
             p = k32.GlobalLock(h)
             if not p:
-                return None
+                return True, None
             try:
-                return ctypes.c_wchar_p(p).value
+                return True, ctypes.c_wchar_p(p).value
             finally:
                 k32.GlobalUnlock(h)
         finally:
             u32.CloseClipboard()
     except Exception:
-        return None
+        return True, None
 
 
 def _clip_set(text: str) -> bool:
@@ -348,7 +377,12 @@ def _inject(ev: dict, state: dict) -> None:
         elif kind == "hotkey":
             from pynput.keyboard import Controller as KC, Key
             kb = state.get("keyboard") or KC()
-            keys = [getattr(Key, k, k) for k in ev.get("keys", [])]
+            names = ev.get("keys", [])
+            if names and names[-1] in ("c", "x") and set(names[:-1]) & {"ctrl", "cmd"}:
+                # A copy: note where the clipboard stands, so the clip_get that
+                # follows can wait for this copy rather than read the last one.
+                state["copy_seq"] = _clip_seq()
+            keys = [getattr(Key, k, k) for k in names]
             for k in keys:
                 kb.press(k)
             for k in reversed(keys):
@@ -363,17 +397,32 @@ def _inject(ev: dict, state: dict) -> None:
             else:
                 kb.type(ev.get("text", ""))  # fallback: type it
         elif kind == "clip_get":
-            txt = _clip_get()
-            sock, lock = state.get("sock"), state.get("sendlock")
-            if sock is not None and txt:
-                blob = _CLIP_MAGIC + txt.encode("utf-8")
-                if lock is not None:
-                    with lock:
-                        _send_msg(sock, blob)
-                else:
-                    _send_msg(sock, blob)
+            # Off the input thread: waiting for a copy must not hold up the
+            # mouse and keyboard behind it.
+            threading.Thread(target=_clip_reply, args=(ev, state), daemon=True).start()
     except Exception:
         pass
+
+
+def _clip_reply(ev: dict, state: dict) -> None:
+    before = state.pop("copy_seq", None) if ev.get("after_copy") else None
+    if before is not None:
+        deadline = time.monotonic() + 1.5
+        while _clip_seq() == before and time.monotonic() < deadline:
+            time.sleep(0.03)
+    txt = _clip_get()
+    sock, lock = state.get("sock"), state.get("sendlock")
+    # An empty answer only goes to a viewer that asks for one (it then says
+    # "nothing copied"); an older viewer would put the empty text on its
+    # clipboard.
+    if sock is None or not (txt or ev.get("after_copy") or ev.get("report_empty")):
+        return
+    blob = _CLIP_MAGIC + (txt or "").encode("utf-8")
+    if lock is not None:
+        with lock:
+            _send_msg(sock, blob)
+    else:
+        _send_msg(sock, blob)
 
 
 class ScreenSession:
