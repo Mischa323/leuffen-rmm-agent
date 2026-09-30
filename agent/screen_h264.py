@@ -45,6 +45,15 @@ def import_error() -> str | None:
 # decode support in browsers; the number is profile(42)/constraints(E0)/level(1F).
 CODEC_STRING = "avc1.42E01F"
 
+# A keyframe is a whole screen -- a few hundred kB -- and on a device with a
+# modest upload it takes more than half a second to get out, with every frame
+# after it waiting behind it. Sent every two seconds, that was a stutter every
+# two seconds, and on a still screen four fifths of the traffic. The stream is
+# TCP, so nothing is ever lost and a keyframe is only needed to start or to
+# recover: the viewer or the server asks for one then (see request_keyframe),
+# and this is merely the safety net for a viewer too old to ask.
+KEYFRAME_EVERY_S = 30
+
 
 class H264Encoder:
     """One libx264 encoder for a fixed frame size. Feed PIL RGB frames, get a
@@ -65,19 +74,35 @@ class H264Encoder:
         cc.framerate = Fraction(self.fps, 1)
         cc.time_base = Fraction(1, self.fps)
         # A CRF maps the 10..90 JPEG-style quality onto x264's 18..30 (lower is
-        # better). zerolatency = no B-frames / lookahead; keyint gives ~2s GOP so
-        # a joining/recovering viewer gets a keyframe quickly. repeat-headers puts
-        # SPS/PPS in front of every IDR (needed for Annex-B decoder recovery).
+        # better). zerolatency = no B-frames / lookahead. Keyframes come when
+        # asked for (see KEYFRAME_EVERY_S); forced-idr makes an asked-for one a
+        # real IDR, and repeat-headers puts SPS/PPS in front of every IDR, so a
+        # decoder can start from any of them.
         crf = int(round(30 - (max(10, min(quality, 90)) - 10) / 80 * 12))
-        gop = max(self.fps * 2, 30)
+        gop = max(self.fps * KEYFRAME_EVERY_S, 30)
         cc.options = {
             "preset": "ultrafast",
             "tune": "zerolatency",
             "crf": str(crf),
+            "forced-idr": "1",
             "x264-params": f"keyint={gop}:min-keyint={self.fps}:scenecut=0:repeat-headers=1",
         }
         self._cc = cc
         self._av = av
+        self._want_key = False
+
+    def request_keyframe(self) -> None:
+        """Make the next frame a keyframe (for a viewer that starts or recovers)."""
+        self._want_key = True
+
+    def _mark(self, frame) -> None:
+        if not self._want_key:
+            return
+        self._want_key = False
+        try:
+            frame.pict_type = self._av.video.frame.PictureType.I
+        except Exception:
+            frame.pict_type = "I"            # older PyAV
 
     def encode(self, pil_rgb_image) -> list[bytes]:
         """Encode one frame (a PIL RGB Image). Returns Annex-B NAL byte strings."""
@@ -86,6 +111,7 @@ class H264Encoder:
         frame.pts = self._pts
         frame.time_base = Fraction(1, self.fps)
         self._pts += 1
+        self._mark(frame)
         out = []
         for pkt in self._cc.encode(frame):
             b = bytes(pkt)
@@ -120,6 +146,7 @@ class H264Encoder:
         frame.pts = self._pts
         frame.time_base = Fraction(1, self.fps)
         self._pts += 1
+        self._mark(frame)
         return [b for b in (bytes(p) for p in self._cc.encode(frame)) if b]
 
     def flush(self) -> list[bytes]:

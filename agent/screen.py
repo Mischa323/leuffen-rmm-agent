@@ -332,6 +332,13 @@ def _attach_input_desktop(state: dict) -> None:
 
 def _inject(ev: dict, state: dict) -> None:
     """Inject one mouse/keyboard/clipboard event (runs in the helper)."""
+    if ev.get("kind") == "keyframe":
+        # A viewer starting or recovering, or the server on behalf of one that
+        # fell behind: the capture loop makes its next frame a keyframe.
+        want = state.get("want_key")
+        if want is not None:
+            want.set()
+        return
     try:
         # On Windows, make sure this thread is on the desktop that currently owns
         # input before injecting, so events reach the login/lock screen too.
@@ -524,16 +531,30 @@ class ScreenSession:
             # Relay helper -> viewer until stopped or the helper disconnects. Both
             # JPEG frames and the LRMMCLIP clipboard blob are forwarded as binary.
             broke_on_send = False
+            # A frame that takes long to get out holds up every frame behind it:
+            # the stutter a viewer sees. Said in this log (at most every ten
+            # seconds, with the slowest since), next to the server's own view.
+            slow_at = 0.0
+            slowest = (0.0, 0)
             while not self._stop:
                 frame = _recv_msg(conn)
                 if frame is None:
                     break
+                started = time.monotonic()
                 fut = asyncio.run_coroutine_threadsafe(self.send_bytes(frame), self._loop)
                 try:
                     fut.result(timeout=15)
                 except Exception:
                     broke_on_send = True
                     break
+                took = time.monotonic() - started
+                if took >= 0.25:
+                    if took > slowest[0]:
+                        slowest = (took, len(frame))
+                    if started - slow_at >= 10.0:
+                        _hlog(f"bridge: a {slowest[1] // 1024} KB frame took {slowest[0] * 1000:.0f} ms "
+                              f"to go out to the server (the link from here is the bottleneck)")
+                        slow_at, slowest = started, (0.0, 0)
             if not self._stop:
                 if broke_on_send:
                     # A frame couldn't be delivered within the timeout — the link
@@ -995,7 +1016,8 @@ class _Pacer:
 
 def _capture_loop(s, fps: int, quality: int, stop: threading.Event,
                   geom: dict | None = None, send_lock: threading.Lock | None = None,
-                  max_edge: int = _MAX_EDGE, codec: str = "jpeg") -> None:
+                  max_edge: int = _MAX_EDGE, codec: str = "jpeg",
+                  want_key: threading.Event | None = None) -> None:
     """Stream the screen until ``stop`` is set or the socket drops. ``codec`` is
     'jpeg' (full frames) or 'h264' (Annex-B, delta-encoded).
 
@@ -1023,6 +1045,7 @@ def _capture_loop(s, fps: int, quality: int, stop: threading.Event,
     hb_bytes = 0
     hb_dups = 0
     hb_grabs = 0
+    hb_keys = 0         # keyframes made because someone asked for one
     hb_last = 0.0
 
     try:
@@ -1061,6 +1084,11 @@ def _capture_loop(s, fps: int, quality: int, stop: threading.Event,
                     if enc is None or enc_size != (out_w, out_h):
                         enc = screen_h264.H264Encoder(out_w, out_h, pacer.requested, quality)
                         enc_size = (out_w, out_h)
+                    elif want_key is not None and want_key.is_set():
+                        enc.request_keyframe()  # a new encoder starts with one anyway
+                        hb_keys += 1
+                    if want_key is not None:
+                        want_key.clear()
                     payloads = enc.encode_bgra(raw, nw, nh)
                     # The encoder rounds to even dimensions; report and map input
                     # against what it actually sends.
@@ -1126,8 +1154,9 @@ def _capture_loop(s, fps: int, quality: int, stop: threading.Event,
                       f"(target {pacer.target}, screen {(src.grabs - hb_grabs) / _dt:.1f}, "
                       f"{hb_dups} repeats), {hb_bytes / 1024 / _dt:.0f} KB/s, "
                       f"{pacer.work_ms:.0f} ms/frame, codec={codec}, "
-                      f"last {frame_w}x{frame_h}")
-                hb_frames = hb_bytes = hb_dups = 0
+                      f"last {frame_w}x{frame_h}"
+                      + (f", {hb_keys} keyframes asked for" if hb_keys else ""))
+                hb_frames = hb_bytes = hb_dups = hb_keys = 0
                 hb_grabs = src.grabs
                 hb_last = now
             # Hold the cadence on an absolute clock: sleeping "the rest of the
@@ -1293,8 +1322,9 @@ def run_screen_helper(argv) -> None:
     # map viewer coordinates back to native pixels; sock + sendlock let the input
     # thread ship a clipboard reply without interleaving with frame sends.
     geom = {"scale": 1.0, "left": 0, "top": 0}
+    want_key = threading.Event()        # set by a keyframe request, taken by the capture loop
     inj_state = {"mouse": None, "keyboard": None, "geom": geom,
-                 "sock": s, "sendlock": send_lock}
+                 "sock": s, "sendlock": send_lock, "want_key": want_key}
 
     def _input_reader():
         n_in = 0
@@ -1321,14 +1351,15 @@ def run_screen_helper(argv) -> None:
     _hlog(f"consent banner {'enabled' if show_banner else 'disabled'} for this session")
     if show_banner:
         cap = threading.Thread(target=_capture_loop,
-                               args=(s, fps, quality, stop, geom, send_lock, max_edge, codec),
+                               args=(s, fps, quality, stop, geom, send_lock, max_edge, codec,
+                                     want_key),
                                daemon=True)
         cap.start()
         _show_consent_banner(stop)
         stop.set()
         cap.join(timeout=5)
     else:
-        _capture_loop(s, fps, quality, stop, geom, send_lock, max_edge, codec)
+        _capture_loop(s, fps, quality, stop, geom, send_lock, max_edge, codec, want_key)
     _hlog("helper exiting")
 
     try:
